@@ -3,6 +3,8 @@ package com.naoh.whalechat.data
 import android.content.Context
 import com.naoh.whalechat.net.DeepSeekClient
 import com.naoh.whalechat.net.DeepSeekException
+import com.naoh.whalechat.net.SearchClient
+import com.naoh.whalechat.net.SearchHit
 import com.naoh.whalechat.net.StreamEvent
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -33,6 +35,9 @@ object ChatEngine {
     private lateinit var store: ConversationStore
     private lateinit var personaStore: PersonaStore
     private val client = DeepSeekClient()
+
+    /** 联网搜索（1.983）。独立于 [client]：它是一次性 HTTP 请求，不是流。 */
+    private val searchClient = SearchClient()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val io = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -123,6 +128,85 @@ object ChatEngine {
         usage = UsageStore(context)
         _conversations.value = store.load().sortedByDescending { it.sortKey }
         _personas.value = personaStore.load().sortedByDescending { it.sortKey }
+        seedBuiltinPersonasIfNeeded()
+    }
+
+    /**
+     * 装完就带一条「大肥鱼」。
+     *
+     * ## 为什么在 [init] 里做，而不是 `if (personas.isEmpty())`
+     *
+     * 判据是**「这个固定 id 在不在」**，不是「列表是不是空的」。
+     * 后者有两个致命后果：
+     *  1. 用户把大肥鱼删掉之后，只要通讯录里还有别的角色，它就永远不回来 ——
+     *     于是「内置联系人」这件事变成了「只在第一次装的时候成立」；
+     *  2. 用户把**所有**角色删光，它又会自己长回来 —— 用户会觉得删不掉。
+     *
+     * 用固定 id 判存在性，就变成了一个**幂等**的补种：每次冷启动检查一遍，
+     * 不在就补，在就什么都不做。用户删掉它之后不会在**同一次会话里**复活
+     * （我们只在 init 跑），下次启动才补 —— 这个时间差是有意的：
+     * 立刻复活会让人以为删除没生效。要彻底不要它，目前只能删完就习惯它再出现一次，
+     * 这是「内置」这件事本身的代价，写在这里免得后来者以为是 bug。
+     *
+     * ## 为什么 `createdAt` 取 `now` 而不是编译期常量
+     *
+     * 排序键见 [Persona.sortKey]：没聊过的角色按 `createdAt` 排。给一个编译期时间戳
+     * 会让它在「刚装完」的那一刻就沉到列表最底 —— 用户会以为没装上。
+     *
+     * ## 落盘时机
+     *
+     * 直接调 [commitPersonas]（异步写），**不阻塞启动**。这一步失败也只是下次启动再补一遍，
+     * 没有数据损失 —— 所以不需要 [savePersonaFromPhone] 那种同步写。
+     */
+    private fun seedBuiltinPersonasIfNeeded() {
+        val existing = _personas.value.any { it.id == BuiltinPersonas.BUILTIN_FISH_ID }
+        if (existing) return
+        _personas.value = _personas.value + BuiltinPersonas.fish()
+        commitPersonas()
+    }
+
+    /**
+     * 落一条「成品预设」角色（目前只有大肥鱼），并返回会话 id。
+     *
+     * ## ⚠️ 为什么不能直接调 [createPersonaChat]
+     *
+     * [createPersonaChat] 是**无条件追加**：它假定调用方给的是一条新角色
+     * （走生成管道时确实如此 —— 每次 [PersonaFactory.generate] 都给一个新 UUID）。
+     *
+     * 但成品预设的 id 是**写死的常量**（[BuiltinPersonas.BUILTIN_FISH_ID]）。
+     * 2026-10-18 实测踩到：在预设页把「添加」按两次，`personas.json` 里就出现
+     * **两条 id 一模一样的大肥鱼**，通讯录里两张同名卡片，点哪张都进同一条会话，
+     * 删掉一张另一张还在 —— 因为删除是按 id 过滤的，`filterNot` 会把两条一起删掉，
+     * 于是「删一个消失两个」。
+     *
+     * 所以这里按 id 去重：**已经在通讯录里就直接复用它的会话**，不新增。
+     * 语义上也更对 —— 「添加」一个已经在通讯录里的人，本来就该是「进 TA 的会话」。
+     */
+    fun addBuiltinPersona(persona: Persona): String {
+        findPersona(persona.id)?.let { existing ->
+            return openPersonaChat(existing.id).orEmpty()
+        }
+        return createPersonaChat(persona)
+    }
+
+    /**
+     * 「重新加回」内置的大肥鱼。
+     *
+     * 和 [seedBuiltinPersonasIfNeeded] 的区别只有一个，但很关键：**用新 id**。
+     *
+     * 用户是主动再要一条的，那就该是一条全新的、没聊过天的鱼 —— 沿用固定 id 的话，
+     * 万一他的旧会话还躺在 `conversations.json` 里（删角色会连会话一起删，
+     * 但极端情况下可能有残留），新角色会**接上那段旧对话**，看起来像见了鬼。
+     *
+     * ⚠️ 注意：**预设页的「添加」不走这里**（那条路走 [addBuiltinPersona]，
+     * 用固定 id + 去重）。这个方法目前没有调用点，是留给「用户删掉之后想再加一条
+     * 全新的」那个场景的 —— 到那时再接一个入口，别直接把它删掉。
+     */
+    fun addBuiltinFish(): String {
+        findPersona(BuiltinPersonas.BUILTIN_FISH_ID)?.let { existing ->
+            return openPersonaChat(existing.id).orEmpty()
+        }
+        return createPersonaChat(BuiltinPersonas.fish(id = BuiltinPersonas.freshFishId()))
     }
 
     fun find(id: String?): Conversation? =
@@ -210,6 +294,88 @@ object ChatEngine {
         if (cleaned.isEmpty()) return
         update(id) { it.copy(title = cleaned.take(TITLE_MAX), titleGenerated = true) }
         commit()
+    }
+
+    /**
+     * 正在重算标题的那条会话 id；null = 没有在跑。
+     *
+     * 给界面用：重命名可能来回好几秒（一次 `complete()` 调用），中间必须有可见反馈，
+     * 否则用户点完菜单那一下就什么都没发生，只能猜。首页拿它决定哪一行挂变形进度条。
+     *
+     * **必须是 Compose 状态**（`StateFlow` 而不是普通字段）：被界面读取的字段不是
+     * 状态的话，改了不会重组 —— 提示永远不出现也不消失。
+     */
+    private val _renamingId = MutableStateFlow<String?>(null)
+    val renamingId: StateFlow<String?> = _renamingId.asStateFlow()
+
+    /**
+     * **强制**重算标题，交给模型总结。用户长按 →「重新命名」走这条。
+     *
+     * ## 与 [generateTitleIfNeeded] 的分工
+     *
+     * 那个是**发送后自动跑**的，第一道闸就是 `if (conversation.titleGenerated) return` ——
+     * 会话已经有了标题就永远不再算。用户要的「重新命名」恰恰就是**绕过这道闸**，
+     * 所以不能复用它（也叫不动它），只能另开一个入口；两边的取数、清洗、
+     * 兜底逻辑则共用同一套私有函数，避免出现「自动生成的标题和手动重新生成的不一样」。
+     *
+     * ## 硬约束
+     *
+     *  * **只对 ask 会话生效。** 角色会话的标题恒等于角色名
+     *    （见 [openPersonaChat]，建会话时就 `titleGenerated = true`），
+     *    叫模型去总结一遍会把角色名冲掉 —— 那不是「重命名」，那是把人物改名。
+     *    这里直接 `return`，界面上也不给这个入口（两处判据都是 `personaId == null`）。
+     *  * **失败要留得住东西**：模型没返回、返回空、或者网络挂了的时候，
+     *    **保留原标题**；原标题本来也是空的才退回第一句提问的截断（`provisionalTitle`）。
+     *    绝不把标题清成空 —— 那会让列表上那一条突然变成「新对话」。
+     *  * **一次只跑一个**：`complete()` 是花钱的调用，连点两下不该发两次。
+     *    已经在跑就直接忽略（顺带也让界面上的进度条只有一个）。
+     */
+    fun regenerateTitle(id: String) {
+        val conversation = find(id) ?: return
+        // 角色会话不参与，理由见上面 KDoc
+        if (conversation.personaId != null) return
+        val (question, answer) = titleSource(conversation) ?: return
+        if (_renamingId.value != null) return
+
+        _renamingId.value = id
+        scope.launch {
+            try {
+                // ⚠️ 1.985：取材范围从「第一条一问一答」改为「**第一条提问 + 最新回答**」。
+                //
+                // 用户原话：「ask对话重新总结功能貌似没有用，多个长对话多次重新生成均没有变化」。
+                // 根因不是「没跑」，而是**每次都算出同一个标题**：
+                //  * 取材是 `titleSource()` 的**第一条**一问一答 —— 不管对话后来聊到哪，
+                //    重算的输入永远是开头那段 ⇒ 模型给出的概括自然每次都一样；
+                //  * 长对话里第一条回答往往很长，`answer.take(600)` 截完,
+                //    剩下的信息量更少 ⇒ 更没变化。
+                //
+                // 「重新总结」的语义应该是**重新概括这条会话**，而长对话概括的重心
+                // 本来就该跟着最新的交流走 ⇒ 输入给「第一条提问（话题起点）+
+                // **最后一条有效回答**（当前话题）」，模型看到的两端信息,
+                // 重算结果才会随对话演进而变。
+                val lastAnswer = conversation.messages
+                    .lastOrNull { it.role == ChatRole.ASSISTANT && !it.error && it.content.isNotBlank() }
+                    ?.content ?: answer
+                val generated = runCatching {
+                    client.complete(
+                        apiKey = settings.value.apiKey,
+                        systemPrompt = TITLE_PROMPT,
+                        userContent = "用户：${question.take(300)}\n助手：${lastAnswer.take(600)}",
+                    )
+                }.getOrNull()
+
+                // 三级兜底：模型给的 → 原来那个 → 第一句提问。
+                val title = cleanTitle(generated)
+                    ?: conversation.title.takeIf { it.isNotBlank() }
+                    ?: provisionalTitle(question)
+                update(id) { it.copy(title = title, titleGenerated = true) }
+                commit()
+            } finally {
+                // 一定要落回 null：抛异常时不复位的话，界面上那条进度条会一直转下去，
+                // 而且后面再也点不动「重新命名」（上面那道「一次只跑一个」的闸）
+                _renamingId.value = null
+            }
+        }
     }
 
     fun clearAll() {
@@ -665,12 +831,32 @@ object ChatEngine {
                 .joinToString("\n\n")
         } ?: current.systemPrompt
 
+        // 联网搜索开关**按会话类型取** —— 判据复用上面那个 `persona`，
+        // **不另造一个**（和 `modeAsk` / `modeChat`、设置页齿轮分叉用的是同一条判据）。
+        // `persona != null` ⇒ 角色会话 ⇒ 读 `searchChat`；否则是一次性问答 ⇒ 读 `searchAsk`。
+        val searchOn = if (persona != null) current.searchChat else current.searchAsk
+
         // 上下文不包含最后那条空的助手占位消息；再按「最近 N 条 + 总字数预算」截一刀。
         // 手表上的会话很容易越滚越长，整段历史照发早晚会撞上模型的上下文上限（400），
         // 而且每一轮都在为很早以前的内容重复付费。
-        val history = trimToBudget(snapshot.messages.dropLast(1), persona = persona != null)
+        //
+        // ★ 1.983：开了搜索时，**把搜索资料要占的那块从历史预算里预先扣掉**
+        //（「在预算里给它留位置」那条做法）。这样「历史 + 搜索资料」的总量
+        // **恒 ≤ `HISTORY_MAX_CHARS`**，不会因为多注入了搜索资料就把总长度顶穿。
+        // 不这么做的话，注入之后总量会到 8000 + 2000 = 10000 字，
+        // 要么超预算、要么得在注入后再裁一刀（那会把刚搜来的资料又裁掉，白花一次钱）。
+        val budget = HISTORY_MAX_CHARS - if (searchOn) SEARCH_CONTEXT_CHARS else 0
+        val history = trimToBudget(
+            snapshot.messages.dropLast(1),
+            persona = persona != null,
+            budgetChars = budget,
+        )
         if (history.isEmpty()) return
 
+        // ⚠️ `_streamingId` **在搜索之前就置位**：搜索是额外 0.2~0.5 秒 + 一次网络往返，
+        // 不置位的话界面在这段时间里什么都不显示，看着就是卡住了。
+        // 置位之后现有的「正在思考…」卡片（`WavyProgressIndicator`）会立刻出现 ——
+        // **复用现有的进度 UI，不新造一套**。
         _streamingId.value = conversationId
         streamJob = scope.launch {
             val reply = StringBuilder()
@@ -678,10 +864,24 @@ object ChatEngine {
             var failure: String? = null
             var stopped = false
 
+            // ★ 联网搜索（1.983）：**只搜这一次，且整段包在 try/catch 里**。
+            //
+            // 三条硬规则都落在这个函数里（见 [searchContext] 的注释）：
+            //  1. 失败**静默降级** —— 搜不到就当没开搜索，继续走原来的对话；
+            //  2. 只搜「最后一条用户消息」当 query，不每轮都搜（省钱 + query 准）；
+            //  3. 结果**不写回 `conversations.json`**，只影响这一次发送。
+            val searchBlock = if (searchOn) searchContext(history, current.apiKey) else ""
+
             try {
                 client.stream(
                     apiKey = current.apiKey,
-                    history = history,
+                    // ★ 注入方式选 A（提示词 §1.4 给的两个选项之一）：
+                    // 把搜索资料拼在**最后那条 user 消息前面**，构造一份**临时副本**。
+                    // ⚠️ `injectSearch()` 只改这个 List，**绝不碰 store**
+                    // ⇒ 搜索资料不进 `conversations.json`。理由：
+                    // 它每轮都会变，落盘会造成「历史里存了一堆过期网页」，
+                    // 而且下一轮会被当成上下文重发、**重复计费**。
+                    history = injectSearch(history, searchBlock),
                     systemPrompt = systemPrompt,
                     // 思考模式**按会话类型取档**：角色会话用 `modeChat`，普通会话用 `modeAsk`。
                     // 两档在设置页**分开存、且一次只显示一组**（设置页按来源分叉，
@@ -781,8 +981,141 @@ object ChatEngine {
     }
 
     /**
+     * 联网搜索 → 一段可以拼进上下文的「搜索资料」文本。**1.983 新增。**
+     *
+     * ## ⚠️⚠️ 这个函数永远不抛异常
+     *
+     * 搜索是**锦上添花**：它挂了绝不能把对话也带下水。
+     * 所以整段包在 `try/catch (Throwable)` 里（`CancellationException` 单独放行），
+     * 任何失败都**静默降级成空串** ⇒ 调用方拿到的空串就等于「没开搜索」，
+     * 照旧走原来的对话。**不许弹窗、不许中断、不许给用户报错。**
+     *
+     * ## 五条设计决定（都写在提示词 §1.4 的规则里）
+     *
+     * 1. **只搜「最后一条用户消息」**：省钱（按次计费）、也让 query 准。
+     *    ⚠️ **已知局限**：多轮对话里最后一句常是「那呢？」这种指代，
+     *    直接拿去搜会搜歪。官方有 `ori_question` 字段可以补充原始问题 ——
+     *    **本版没用它**，理由见下。
+     * 2. **质量闸门 `rerank_score >= 1.5`**（`SEARCH_MIN_SCORE`）。
+     *    官方文档明说「≥1.5 为优质」，**实测对得上**（好结果 1.8~2.3、
+     *    乱码冷门词只有 0.47~0.52）。全是低分就说明这次没搜到有用的
+     *    ⇒ **干脆不拼进上下文**，比硬塞一堆不相关网页干净得多
+     *    （那些网页还会白烧 token，**反而更贵**）。
+     * 3. **`summary` 必须截断**：实测最长 **3409 字**（远超文档说的 600~800）。
+     *    每条截到 `SEARCH_SUMMARY_CHARS`、总量封顶 `SEARCH_CONTEXT_CHARS`。
+     *    ⚠️ 截断在**字符边界**上做 —— Kotlin 的 `String` 是 UTF-16，
+     *    `take(n)` 按 **code unit** 切，对中文（BMP 内、单 code unit）是安全的；
+     *    只有 emoji 这类代理对才可能被切成两半，所以下面用
+     *    [safeTruncate] 再挡一道（**不许把 UTF-8 切坏**）。
+     * 4. **`date` 可能为 `null`** ⇒ 拼文本时要优雅降级（**别输出 "null"**）。
+     *    `SearchHit.date` 那里已经把显式 null 收敛成 `null` 了，这里只管不显示。
+     * 5. **失败静默**：见上。
+     *
+     * ## 为什么没用 `ori_question`
+     *
+     * 它的用途是「把多轮对话里的原始问题一起发过去，帮搜索引擎理解指代」。
+     * 本版没用的理由：要正确使用它，得先判断「这一句是不是指代」——
+     * 而那个判断本身就需要一次模型调用（或一套启发式规则），
+     * **成本与收益不成比例**（多一次调用比省下的那点搜索质量贵得多）。
+     * 这条局限**如实写进报告**，等用户反馈「搜歪」再针对性解决。
+     *
+     * @param history 已经过预算裁剪的历史（用来取最后一条用户消息当 query）。
+     * @return 拼好的搜索资料；任何失败 / 没有优质结果 ⇒ **空串**。
+     */
+    private suspend fun searchContext(history: List<ChatMessage>, apiKey: String): String {
+        val query = history.lastOrNull { it.role == ChatRole.USER }?.content?.trim().orEmpty()
+        if (query.isEmpty()) return ""
+
+        return try {
+            val hits = searchClient.search(apiKey = apiKey, query = query, count = SEARCH_COUNT)
+            // ★ 质量闸门：只留官方认定「优质」的（≥1.5）。
+            val good = hits.filter { it.rerankScore >= SEARCH_MIN_SCORE }
+            if (good.isEmpty()) return ""
+            buildSearchBlock(query, good)
+        } catch (e: CancellationException) {
+            // 用户切走 / 停止 ⇒ 照常往上传，别吞掉取消信号
+            throw e
+        } catch (e: Throwable) {
+            // ★ 静默降级：搜不到就当没开搜索。**这一行是这个功能安全性的全部。**
+            ""
+        }
+    }
+
+    /** 把优质结果拼成一段给模型读的「搜索资料」。**总量封顶 [SEARCH_CONTEXT_CHARS]。** */
+    private fun buildSearchBlock(query: String, hits: List<SearchHit>): String {
+        val body = StringBuilder()
+        for ((i, hit) in hits.withIndex()) {
+            val piece = buildString {
+                append("【${i + 1}】")
+                if (hit.title.isNotBlank()) append(hit.title.trim())
+                // ⚠️ date 可能为 null ⇒ 整段跳过，**绝不输出字面量 "null"**
+                hit.date?.takeIf { it.isNotBlank() }?.let { append("（").append(it.trim()).append("）") }
+                append("\n")
+                append(safeTruncate(hit.summary.trim(), SEARCH_SUMMARY_CHARS))
+                append("\n")
+            }
+            // 封顶：加了这一段会超预算就不加了（宁可少给几条，也不超预算）
+            if (body.length + piece.length > SEARCH_CONTEXT_CHARS) break
+            body.append(piece)
+        }
+        if (body.isEmpty()) return ""
+        return buildString {
+            append("以下是与问题相关的联网搜索结果，供参考（可能不完整或有误，")
+            append("请结合你自己的知识判断，不要照抄）：\n")
+            append(body)
+            append("\n用户的问题：")
+            append(query)
+        }
+    }
+
+    /**
+     * 按**字符边界**截断，且不让代理对（emoji 之类）被切成两半。
+     *
+     * ⚠️ 直接 `s.take(n)` 对中文是安全的（BMP 内单 code unit），
+     * 但结尾正好是 emoji 的**高位代理**时会切出一个孤立代理 ——
+     * 那玩意拼进 JSON 会变成替换字符。所以末尾若落在代理对中间就再退一位。
+     */
+    private fun safeTruncate(s: String, max: Int): String {
+        if (s.length <= max) return s
+        var end = max
+        if (end > 0 && Character.isHighSurrogate(s[end - 1])) end -= 1
+        return s.substring(0, end) + "…"
+    }
+
+    /**
+     * 把搜索资料拼在**最后那条 user 消息前面**（提示词 §1.4 的选项 A）。
+     *
+     * ⚠️⚠️ **返回的是一份新 List，绝不写回 store** —— 这是「不落盘」的实现点。
+     * `ChatMessage` 是 data class，`copy` 出来的是新对象；
+     * `history` 本身是 `trimToBudget` 的返回值（已经是新 List），
+     * 所以这里连「改动到了别处」的可能都没有。
+     *
+     * 为什么选 A 而不是 B（插一条额外 system 消息）：
+     *  * **A 只动一条消息** ⇒ 消息条数不变，`history` 的结构与不发搜索时一致；
+     *  * B 会多插一条消息，而 `buildBody` 里 system 只认第一个参数、
+     *    并不遍历 history 里的 system —— 要支持 B 得改 `buildBody`，
+     *    那会碰到**对话主链路**（风险大得多）。
+     *  * A 在语义上也更贴切：「资料 + 这个问题」本来就是一条用户输入。
+     */
+    private fun injectSearch(
+        history: List<ChatMessage>,
+        searchBlock: String,
+    ): List<ChatMessage> {
+        if (searchBlock.isBlank() || history.isEmpty()) return history
+        val lastUserIndex = history.indexOfLast { it.role == ChatRole.USER }
+        if (lastUserIndex < 0) return history
+        return history.mapIndexed { i, m ->
+            if (i != lastUserIndex) m
+            else m.copy(content = searchBlock + "\n\n" + m.content)
+        }
+    }
+
+    /**
      * 模型总结标题。用便宜的非推理模型 + 低温度，失败了就用首条问题的截断兜底。
      * 整个流程刻意「静默」：标题拿不到不该影响聊天。
+     *
+     * 只在「这条会话还没有过标题」时跑（`titleGenerated` 是那道闸）。
+     * 用户主动要求重算走 [regenerateTitle]。
      */
     private fun generateTitleIfNeeded(conversationId: String) {
         val conversation = find(conversationId) ?: return
@@ -791,12 +1124,7 @@ object ChatEngine {
         // 叫模型去总结一遍纯属白烧钱，而且总结出来的标题还会把角色名冲掉。
         if (conversation.personaId != null) return
 
-        val question = conversation.messages.firstOrNull { it.role == ChatRole.USER }?.content
-            ?: return
-        val answer = conversation.messages
-            .firstOrNull { it.role == ChatRole.ASSISTANT && !it.error && it.content.isNotBlank() }
-            ?.content
-            ?: return
+        val (question, answer) = titleSource(conversation) ?: return
 
         val apiKey = settings.value.apiKey
         scope.launch {
@@ -812,6 +1140,32 @@ object ChatEngine {
             update(conversationId) { it.copy(title = title, titleGenerated = true) }
             commit()
         }
+    }
+
+    /**
+     * 从一条会话里取出「拿给标题生成器看的一问一答」。
+     *
+     * 取的是**第一条提问**和**第一条真的回答了的内容**（跳过错误提示和空回答）——
+     * 会话往后越聊越远，标题该概括的是开头那个话题，不是最后一句。
+     *
+     * ⚠️ **1.985：只有 [generateTitleIfNeeded]（自动、首算）还用它。**
+     * [regenerateTitle]（用户手动重算）改成了「第一条提问 + **最后一条有效回答**」，
+     * 理由见那边 —— 用户反馈「多次重新生成均没有变化」，根因就是两个入口
+     * 都只看开头那段，输入不变 ⇒ 输出也不变。
+     *
+     * 两处共用的是**兜底与清洗**逻辑（[cleanTitle] / [provisionalTitle]），
+     * 取材分开是 1.985 有意为之，**不是漏改**。
+     *
+     * 任何一半取不到就返回 null ⇒ 调用方放弃（没提问 / 没有有效回答时都不该起标题）。
+     */
+    private fun titleSource(conversation: Conversation): Pair<String, String>? {
+        val question = conversation.messages.firstOrNull { it.role == ChatRole.USER }?.content
+            ?: return null
+        val answer = conversation.messages
+            .firstOrNull { it.role == ChatRole.ASSISTANT && !it.error && it.content.isNotBlank() }
+            ?.content
+            ?: return null
+        return question to answer
     }
 
     // ------------------------------------------------------------- 状态修改
@@ -895,10 +1249,38 @@ object ChatEngine {
         }
     }
 
+    /**
+     * 就地更新一条会话（命中才改、命中才发射）。
+     *
+     * ## ⚠️ 隐式契约（1.992 写下来，之前没人写）
+     *
+     * 1. **命中才发射、未命中完全不发射**。
+     *    旧的 `.map {}` 写法在未命中时也返回内容相同的新 List，
+     *    靠 `MutableStateFlow` 的 `equals` 判等（`Conversation` 是 data class，
+     *    逐元素比较）兜住「不发射」；1.992 起 `index < 0 return` 把它变成显式行为。
+     *    ⚠️ 若哪天 `Conversation` 的 `equals` 语义变了（如实现成引用比较），
+     *    「改前 `.map{}` 会发射、改后不发射」就会分叉 —— 那时这里要重新审。
+     * 2. **[transform] 不许就地修改 `messages`**，必须 `copy()` 出新实例。
+     *    `Conversation` **没有标 `@Immutable`**（1.992 明确决定不加，理由见
+     *    whalechat-1.992-实现-prompt.md §2.5：commit() 每次新建容器，加了也白加，
+     *    还欠一笔「就地改就 UI 停更且不报错」的永久债）⇒
+     *    Compose 靠**实例变化**判断重组，就地改 = UI 停更。
+     *
+     * ## 为什么从 `.map {}` 改成 `indexOfFirst`（1.992，S-1-B）
+     *
+     * **纯可读性收益，性能收益可忽略**（如实写，别夸大）：
+     * 两种写法都 O(n) 分配新容器；未命中的实例在两种写法下都不拷贝；
+     * 省下的只是「命中后不再继续遍历」——会话数几十条，纳秒级。
+     * 换 `indexOfFirst` 的真实价值是语义直白（「找到那一条，改它」）
+     * 且 `transform` 的调用点显式。
+     */
     private inline fun update(conversationId: String, transform: (Conversation) -> Conversation) {
-        _conversations.value = _conversations.value.map { conversation ->
-            if (conversation.id == conversationId) transform(conversation) else conversation
-        }
+        val current = _conversations.value
+        val index = current.indexOfFirst { it.id == conversationId }
+        if (index < 0) return
+        val list = current.toMutableList()
+        list[index] = transform(list[index])
+        _conversations.value = list
     }
 
     /**
@@ -926,12 +1308,34 @@ object ChatEngine {
 
     // ------------------------------------------------------------------ 杂项
 
-    private fun provisionalTitle(question: String) = question
-        .replace(Regex("\\s+"), " ")
-        .trim()
-        .take(TITLE_MAX)
+    /**
+     * 兜底标题（第一句提问的截断）。**同样走词边界**（理由见 [cleanTitle]），
+     * 否则英文提问的兜底标题也会出现半截词。
+     */
+    private fun provisionalTitle(question: String): String {
+        val cleaned = question.replace(Regex("\\s+"), " ").trim()
+        if (cleaned.length <= TITLE_MAX) return cleaned
+        val head = cleaned.take(TITLE_MAX)
+        val lastSpace = head.lastIndexOf(' ')
+        return if (lastSpace > 0) head.take(lastSpace).trimEnd() else head
+    }
 
-    /** 把模型可能带上来的引号、序号、句末标点都削掉。 */
+    /**
+     * 把模型可能带上来的引号、序号、句末标点都削掉，并按 [TITLE_MAX] 截断。
+     *
+     * ## ⚠️ 1.985：截断改成**词边界优先**（「Apple Intell」bug 的修法）
+     *
+     * 用户原话：「标题是 apple intelligence 却显示不全」。实测根因：
+     * 英文标题按 `take(TITLE_MAX=12)` **字符截** ⇒ `"Apple Intelligence"(18)` 变
+     * **`"Apple Intell"`** —— 单词被拦腰切断。中文没有这个问题（字就是词），
+     * 所以这刀只对**含空格的（英文类）标题**做词边界处理：
+     *
+     *  * 截断点正好落在词中间 ⇒ **退到上一个空格**（`"Apple Intelligence"` → `"Apple"`）；
+     *  * 截断点在空格/词尾 ⇒ 原样保留。
+     *
+     * 配套把 [TITLE_PROMPT] 也改了（「英文不超过 3 个词、在完整单词边界结束」），
+     * 双保险：模型尽量给短的，万一给了长的也不会出现半截词。
+     */
     private fun cleanTitle(raw: String?): String? {
         val firstLine = raw?.lineSequence()?.firstOrNull { it.isNotBlank() } ?: return null
         val stripped = firstLine
@@ -939,7 +1343,13 @@ object ChatEngine {
             .trim()
             .trim('"', '\'', '“', '”', '‘', '’', '「', '」', '『', '』', '《', '》', '。', '，', '、', '.', ',', ':', '：')
             .trim()
-        return stripped.takeIf { it.isNotEmpty() }?.take(TITLE_MAX)
+        if (stripped.isEmpty()) return null
+        if (stripped.length <= TITLE_MAX) return stripped
+
+        // 含空格 ⇒ 词边界截断（英文/混排）；退到上一个空格，别把词切一半。
+        val head = stripped.take(TITLE_MAX)
+        val lastSpace = head.lastIndexOf(' ')
+        return if (lastSpace > 0) head.take(lastSpace).trimEnd() else head
     }
 
     /** 手表列表宽度有限，标题超过这个字数就会被截断成省略号。 */
@@ -967,6 +1377,46 @@ object ChatEngine {
     /** 带上文的字符预算。约等于 5k token 量级，离上下文上限还很远，不会触发 400。 */
     private const val HISTORY_MAX_CHARS = 8_000
 
+    // ------------------------------------------------------------ 联网搜索（1.983）
+
+    /**
+     * 一次搜索要几条。官方范围 1~50，默认 10。
+     *
+     * 取 5 的理由：真正进上下文的还要过 `rerank_score >= 1.5` 的质量闸门
+     * （实测一提问通常只有 1~3 条优质结果），要再多也只会被闸门滤掉，
+     * 却已经**按次计过费**了。
+     */
+    private const val SEARCH_COUNT = 5
+
+    /**
+     * **质量闸门**：官方文档明说「`rerank_score` ≥ 1.5 为优质」，**实测对得上**
+     * （好结果 1.8~2.3；乱码冷门词只有 0.47~0.52）。
+     *
+     * ⚠️ 低于这个分的一律**不拼进上下文** —— 全是低分说明这次没搜到有用的，
+     * 硬塞一堆不相关网页不只会让回答跑偏，还会**白烧 token（反而更贵）**。
+     */
+    private const val SEARCH_MIN_SCORE = 1.5
+
+    /**
+     * 每条 `summary` 的截断长度。**实测最长 3409 字**（远超文档说的 600~800），
+     * 不截的话一次搜索就能吃掉几千 token。
+     *
+     * 取 500：约 3~4 段摘要的量，够模型读出要点。
+     */
+    private const val SEARCH_SUMMARY_CHARS = 500
+
+    /**
+     * 整块搜索资料的字符上限（**同时是给历史预算让出来的那一块**，见 [trimToBudget]）。
+     *
+     * 取 2000 的理由：`HISTORY_MAX_CHARS` 是 8000，让出 1/4 给搜索资料，
+     * 历史仍有 6000 字（≈10 轮对话），够用；
+     * 而 2000 字能装下 4 条 500 字摘要 —— 比一次问到的优质结果还多一点。
+     *
+     * ⚠️ 这个值**必须与 `trimToBudget` 里扣的那一笔一致**，否则「历史 + 搜索」
+     * 的总量就不是 `HISTORY_MAX_CHARS` 了。两处都读这个常量，**别各写一个字面量**。
+     */
+    private const val SEARCH_CONTEXT_CHARS = 2_000
+
     /**
      * 从最新往回留，直到用满条数或字数预算。
      *
@@ -974,12 +1424,20 @@ object ChatEngine {
      * 也得把这句话发出去，否则用户按了发送却永远得不到回答。
      *
      * @param persona 角色会话放宽条数到 [PERSONA_HISTORY_MAX_MESSAGES]、字数预算不变。
+     * @param budgetChars 字数预算覆盖。**1.983 联网搜索用**：开了搜索时要给它留出位置
+     *   （见 [SEARCH_CONTEXT_CHARS]），所以历史这边得把预算让出来一块，
+     *   否则「历史 8000 字 + 搜索 2000 字」= 10000 字，超出原来的预算。
+     *   ⚠️ 默认值仍是 [HISTORY_MAX_CHARS]，**不开搜索时行为与 1.982 逐字相同**。
      */
-    private fun trimToBudget(messages: List<ChatMessage>, persona: Boolean = false): List<ChatMessage> {
+    private fun trimToBudget(
+        messages: List<ChatMessage>,
+        persona: Boolean = false,
+        budgetChars: Int = HISTORY_MAX_CHARS,
+    ): List<ChatMessage> {
         if (messages.isEmpty()) return messages
         val maxMessages =
             if (persona) PERSONA_HISTORY_MAX_MESSAGES else HISTORY_MAX_MESSAGES
-        var budget = HISTORY_MAX_CHARS
+        var budget = budgetChars
         val kept = ArrayDeque<ChatMessage>()
         for (message in messages.asReversed()) {
             if (kept.size >= maxMessages) break
@@ -993,5 +1451,7 @@ object ChatEngine {
 
     private const val TITLE_PROMPT =
         "你是会话标题生成器。读一段对话，输出一个概括其主题的中文短标题。" +
-            "要求：不超过 12 个字；不要引号、书名号、标点或句号；不要任何解释、前缀或序号；只输出标题本身。"
+            "要求：不超过 12 个字；英文标题不超过 3 个单词；" +
+            "不要引号、书名号、标点或句号；不要任何解释、前缀或序号；只输出标题本身。" +
+            "如果对话主题是英文，输出英文标题；必须在完整的单词边界处结束，不要截断单词。"
 }

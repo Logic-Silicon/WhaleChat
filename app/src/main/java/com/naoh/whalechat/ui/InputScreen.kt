@@ -1,5 +1,6 @@
 package com.naoh.whalechat.ui
 
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -25,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
@@ -52,6 +54,15 @@ import com.naoh.whalechat.voice.rememberVoiceInput
 sealed interface InputTarget {
     data object ApiKey : InputTarget
     data object SystemPrompt : InputTarget
+
+    /** 通用接口（OpenAI 兼容 ASR）的接口地址。1.982 加回来 */
+    data object AsrUrl : InputTarget
+
+    /** 通用接口的 Key。**允许留空** —— 本机 whisper.cpp 一类的服务不鉴权 */
+    data object AsrKey : InputTarget
+
+    /** 通用接口的模型名 */
+    data object AsrModel : InputTarget
 
     /** 讯飞的 AppID */
     data object XfyAppId : InputTarget
@@ -126,12 +137,37 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
     val keyboard = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
 
+    // ⚠️⚠️ 2.0：**三星键盘适配整条回滚**（用户原话：「三星键盘 bug 完全修了没用，
+    // 别修了，回显条也删除，三星键盘是全屏的也看不见」）。
+    //
+    // 1.987~1.991 那一轮按《三星键盘输入问题-定位与修复.md》落了修法 A（永远写回）、
+    // B（三星上 ImeAction.None）、C（顶部回显条）三件——**真机验证全部无效**：
+    // 三星 HoneyBoard 是整屏接管，修法 C 的回显条在键盘底下根本看不见，
+    // A/B 也没能让输入内容显示出来。问题大概率出在 Compose `BasicTextField` 与
+    // HoneyBoard 的 InputConnection 同步路径本身，应用侧无解。
+    //
+    // ⇒ 本版恢复 1.987 之前的原始行为：
+    //  * `ImeAction` 恒为 Send/Done（不再按输入法分支）；
+    //  * 回显条删除；
+    //  * ⚠️ **修法 A 的「换行也写回」保留**——它是纯行为改进（换行变空格写回
+    //    而不是吞掉），对 Gboard 无害、对三星也无害（无效但也无副作用），
+    //    删它只会让 Gboard 的回车行为退回老问题。见 onValueChange 处的注释。
+    //
+    // 若将来重启这条线，入口是 `InterceptPlatformTextInput`（修法 D，
+    // 抓 InputConnection 全量回调先取证）或 `RemoteInputIntentHelper`（修法 E，
+    // Google 官方推荐、任何 IME 都兼容，但要重做交互）——见那份定位文档。
+
     val isChat = target is InputTarget.Chat
 
     val title = when (target) {
         // 全名而不是「API Key」：语音那一侧也有 Key，进来只看这一行得能分清是哪一套。
         InputTarget.ApiKey -> "DeepSeek API Key"
         InputTarget.SystemPrompt -> "系统提示词"
+        // 三格都带「识别」二字：这一页上还有 DeepSeek 的 Key 和讯飞的 Key，
+        // 只说「接口地址」「Key」在手表这一条窄标题上分不出是哪一套。
+        InputTarget.AsrUrl -> "识别接口地址"
+        InputTarget.AsrKey -> "识别接口 Key"
+        InputTarget.AsrModel -> "识别模型名"
         InputTarget.XfyAppId -> "讯飞 AppID"
         InputTarget.XfyApiKey -> "讯飞 APIKey"
         InputTarget.XfyApiSecret -> "讯飞 APISecret"
@@ -151,6 +187,12 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
     val placeholder = when (target) {
         InputTarget.ApiKey -> "sk-…"
         InputTarget.SystemPrompt -> "留空表示不加设定"
+        // 地址要写全：这一格填什么就直接 POST 什么，App 不会帮你补 /v1/audio/transcriptions
+        // 那一段（各家路径不一样）。占位符里给个完整样例，省得用户只填主机名然后收 404。
+        InputTarget.AsrUrl -> "https://…/v1/audio/transcriptions"
+        // 「可留空」必须写出来：本机跑的服务通常不鉴权，而「Key」两个字会让人以为必填
+        InputTarget.AsrKey -> "可留空"
+        InputTarget.AsrModel -> "FunAudioLLM/SenseVoiceSmall"
         // 讯飞控制台里三样都是十六进制串，长度固定，写出来省得用户怀疑自己抄错了
         InputTarget.XfyAppId -> "8 位十六进制"
         InputTarget.XfyApiKey -> "32 位十六进制"
@@ -185,6 +227,9 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
         val initial = when (target) {
             InputTarget.ApiKey -> settings.apiKey
             InputTarget.SystemPrompt -> settings.systemPrompt
+            InputTarget.AsrUrl -> settings.asrUrl
+            InputTarget.AsrKey -> settings.asrKey
+            InputTarget.AsrModel -> settings.asrModel
             InputTarget.XfyAppId -> settings.xfyAppId
             InputTarget.XfyApiKey -> settings.xfyApiKey
             InputTarget.XfyApiSecret -> settings.xfyApiSecret
@@ -225,6 +270,9 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
         when (target) {
             InputTarget.ApiKey -> ChatEngine.settings.setApiKey(value)
             InputTarget.SystemPrompt -> ChatEngine.settings.setSystemPrompt(value)
+            InputTarget.AsrUrl -> ChatEngine.settings.setAsrUrl(value)
+            InputTarget.AsrKey -> ChatEngine.settings.setAsrKey(value)
+            InputTarget.AsrModel -> ChatEngine.settings.setAsrModel(value)
             InputTarget.XfyAppId -> ChatEngine.settings.setXfyAppId(value)
             InputTarget.XfyApiKey -> ChatEngine.settings.setXfyApiKey(value)
             InputTarget.XfyApiSecret -> ChatEngine.settings.setXfyApiSecret(value)
@@ -255,7 +303,7 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
      * 键盘回车兜底那条路会把带换行的原文直接递进来。
      */
     fun submit(raw: String = field.text) {
-        val value = raw.trim()
+        val value = raw.replace('\n', ' ').trim()
         // 空值一律不提交 —— 只有一个例外：改预设的某一格时，**清空就是「这一项不要了」**。
         // 拼生成描述时空白字段本来就会被略过，所以空串在这一处是有意义的输入，
         // 不能被当成「什么都没输入」挡回去（否则预设自带的默认值永远删不掉）。
@@ -330,6 +378,11 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            // ⚠️⚠️ 2.0：1.987 加的「实时回显条」已删除（用户原话：「回显条也删除，
+            // 三星键盘是全屏的也看不见」）。三星 HoneyBoard 整屏接管后键盘下面
+            // 什么都看不见，这条镜子没有观众。Gboard 下它也只在「输入框被键盘
+            // 压住」的场景有用，而那不是常态。
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -352,14 +405,44 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
                         BasicTextField(
                             value = field,
                             onValueChange = { value ->
-                                // Wear 版 Gboard 有个要命的毛病（本地实测复现）：
-                                // 回车键不走 ImeAction.Send，而是往输入框里塞一个换行。
-                                // 用户在表盘上敲完字按回车，消息永远发不出去，
-                                // 看起来就是「问答完全不可用」。
-                                // 这里把换行截下来当回车用：直接触发提交，输入框也不留换行。
-                                // 真键盘 / 手机输入法依旧走 keyboardActions 的 onSend/onDone。
-                                if ('\n' in value.text) {
-                                    submit(value.text)
+                                // ============================================================
+                                // ⚠️⚠️ 1.987：这条分支重写了（三星键盘输入不刷新的修法 A）
+                                // ============================================================
+                                //
+                                // ## 改前的写法（也是「三星键盘下输入不刷新」的根因）
+                                //
+                                // ```kotlin
+                                // if ('\n' in value.text) { submit(value.text) }  // ← 不写回 field
+                                // else { field = value }
+                                // ```
+                                //
+                                // 那条「换行 → 提交且不写回」的分支当初是为 **Wear 版 Gboard**
+                                // 写的（它的回车不走 ImeAction.Send，而是往输入框塞换行）。
+                                // **三星 HoneyBoard 的 composing 行为不同**：它会一次性 commit
+                                // 整段 composing 文本（常见带尾部 `\n`），一旦命中这个分支 ⇒
+                                // `submit()` 触发、**`field` 停在旧值** ⇒ Compose 的
+                                // EditingBuffer 与 IME 立刻失步 ⇒ 用户看到的就是
+                                // 「输入内容不更新：只有每次唤起时的文字显示，之后改/增都不显示」。
+                                //
+                                // 定位与机制见会话目录《三星键盘输入问题-定位与修复.md》
+                                // （嫌疑 A，判定表第 2/3 行）。
+                                //
+                                // ## 修法（文档「修法 A」原样落地）
+                                //
+                                // **不管 IME 送什么，都先写回 state**（2.0 保留这一条）；
+                                // 提交动作交给「离开 = 提交」的既有兜底
+                                // （BackHandler / onDispose，不依赖 IME 动作）。
+                                //  * ⚠️ 光标必须跟着给（`TextRange(cleaned.length)`）：
+                                //    写回不带 selection 会落到 0，这是本项目踩过的坑。
+                                //  * Gboard 的「回车塞换行」依然被处理：换行变空格留在框里，
+                                //    不是吞掉；「敲完就发」由 BackHandler 承接。
+                                //  * 1.987 曾试图把它当三星修复的一部分——真机验证三星无效
+                                //    （见上面 2.0 的回滚说明），但这条本身无害且对 Gboard 有益，
+                                //    **保留不回滚**。
+                                val raw = value.text
+                                if ('\n' in raw) {
+                                    val cleaned = raw.replace('\n', ' ')
+                                    field = TextFieldValue(cleaned, TextRange(cleaned.length))
                                 } else {
                                     field = value
                                 }
@@ -376,6 +459,9 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
                             // 换行一进来就提交并吞掉，输入框实际上仍然保持单行。
                             cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                             keyboardOptions = KeyboardOptions(
+                                // ⚠️ 2.0：恢复 1.987 前的写法（恒为 Send/Done）。
+                                // 1.987 的「三星走 None」分支随整条三星适配回滚删除
+                                // （真机验证无效，见上）。
                                 imeAction = if (isChat) ImeAction.Send else ImeAction.Done,
                             ),
                             keyboardActions = KeyboardActions(

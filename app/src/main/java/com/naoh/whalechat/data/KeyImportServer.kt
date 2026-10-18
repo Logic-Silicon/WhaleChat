@@ -28,19 +28,44 @@ import kotlin.coroutines.CoroutineContext
 enum class ImportStatus { WAITING, DONE, FAILED }
 
 /**
- * 手机上提交上来的一屏设置。**字段就是表单里那六格，一个不多一个不少。**
+ * 手机上提交上来的一屏设置。**字段就是表单上那些格子，一个不多一个不少。**
  *
  * 提交的语义是**整屏覆盖**（用户看到的是一张真值表，清空某一格 = 删掉那一项），
  * 所以这里没有任何「空串表示没填」的妥协 —— 空串在这里是有含义的输入。
+ *
+ * ## 1.982：加回通用接口那三格
+ *
+ * [asrUrl] / [asrKey] / [asrModel] 是「通用接口」（OpenAI 兼容 ASR）那一档的参数，
+ * 1.0 时代就在这张表上，后来随整档一起被删掉，1.982 按用户要求加回来。
+ *
+ * ⚠️ **加字段 = 一条五处的联动链，少一处就是「存了但没生效」**：
+ * [ImportedCredentials] 本体 → [KeyImportServer.FORM_FIELDS] 白名单
+ * → `handlePost` 里那几行 `form[...]` → 表单 HTML 的输入格
+ * → [SettingsStore.importFromPhone] 的 `copy(...)`。
+ * 这五处漏掉任何一处，症状都是「手机上说保存成功、手表上那一格还是空的」。
  */
 data class ImportedCredentials(
     val apiKey: String = "",
     val asrEngine: String = AsrEngine.SYSTEM.key,
+    /** 通用接口的接口地址。默认值和设置里的兜底一致，见 `Settings.DEFAULT_ASR_URL` */
+    val asrUrl: String = Settings.DEFAULT_ASR_URL,
+    /** 通用接口的 Key。**默认留空** —— 本机服务不鉴权，空 = 不发 `Authorization` 头 */
+    val asrKey: String = "",
+    val asrModel: String = Settings.DEFAULT_ASR_MODEL,
     val xfyAppId: String = "",
     val xfyApiKey: String = "",
     val xfyApiSecret: String = "",
 ) {
-    /** 除识别引擎外，所有格都空着。引擎是个下拉框，永远有值，不参与「空不空」的判断。 */
+    /**
+     * 除识别引擎外，所有格都空着。引擎是个下拉框，永远有值，不参与「空不空」的判断。
+     *
+     * ⚠️ 通用接口那三格**不参与**这个判断，理由有两条，都别顺手加进来：
+     *  1. [asrUrl] / [asrModel] 的默认值**非空**（预填硅基流动那套），
+     *     把它们算进来，这个「整页都空」的闸门就**永远不会触发** ——
+     *     而那正是防「手滑把凭证全清掉」的唯一一道闸；
+     *  2. 就算按「用户实际填了什么」算，清空地址也不等于清掉凭证 ——
+     *     它只是让通用接口那一档暂时不可用，不会丢任何东西。
+     */
     val allFieldsBlank: Boolean
         get() = listOf(apiKey, xfyAppId, xfyApiKey, xfyApiSecret).all { it.isBlank() }
 
@@ -62,9 +87,6 @@ interface PersonaBridge {
 
     /** 整对象覆盖 + **同步落盘**；返回 null 表示成功，非 null 是人话错误。 */
     suspend fun save(persona: Persona): String?
-
-    /** 把一句描述扩写成完整人设。**必须复用 [PersonaFactory]**，不要另写一套生成。 */
-    suspend fun generate(description: String): PersonaResult
 }
 
 /**
@@ -167,8 +189,10 @@ class KeyImportServer(
     /**
      * 处理一个请求。
      *
-     * 是 `suspend` 的：角色那一页的「用 AI 生成一份」要真的去调模型，
-     * 那是挂起调用。运行它的仍然是每连接一条的 IO 协程，所以等一下不会堵住别人。
+     * 是 `suspend` 的：角色那页的「保存到手表」走 `PersonaBridge.save()`，
+     * 它是**同步落盘**的挂起调用（写 prefs + 文件 IO）。运行它的仍然是
+     * 每连接一条的 IO 协程，所以等一下不会堵住别人。
+     * （1.987 之前还有一个更慢的理由 —— 「用 AI 生成」要调模型；那条链路已删。）
      */
     private suspend fun handle(sock: Socket) {
         try {
@@ -265,6 +289,9 @@ class KeyImportServer(
             val submitted = ImportedCredentials(
                 apiKey = form[FIELD_API_KEY].orEmpty(),
                 asrEngine = form[FIELD_ASR_ENGINE].orEmpty(),
+                asrUrl = form[FIELD_ASR_URL].orEmpty(),
+                asrKey = form[FIELD_ASR_KEY].orEmpty(),
+                asrModel = form[FIELD_ASR_MODEL].orEmpty(),
                 xfyAppId = form[FIELD_XFY_APP_ID].orEmpty(),
                 xfyApiKey = form[FIELD_XFY_API_KEY].orEmpty(),
                 xfyApiSecret = form[FIELD_XFY_API_SECRET].orEmpty(),
@@ -291,15 +318,24 @@ class KeyImportServer(
 
         // ---- 角色 ----
 
-        // 「用 AI 生成一份」也可能落在这两条 POST 上：编辑页那颗按钮带了
-        // formaction 指向专门的 /gen 路由，但老浏览器不认 formaction，就会把
-        // 同样的 body 发到主路由 —— 那时候靠 act=gen 兜住，行为一致。
+        // ⚠️⚠️ 1.987：**「用 AI 生成一份」整条链路删除**（用户原话：
+        // 「手机端『用ai生成人设』功能直接删除，不管是新建还是管理已有」）。
+        //
+        // 原来这里有两个生成入口，全删：
+        //  * `route == "$listPath/new"` 的 POST 里 `act == ACT_GENERATE` 的分支；
+        //  * `route.startsWith("$listPath/")` 的 POST 里 `isGenerate`（/gen 路由）的分支；
+        // 配套删除的还有：表单 HTML 上那颗按钮 + 说明文字、`generateAndRender()`、
+        // `PersonaBridge.generate()`、`ImportKeyScreen` 那边的实现、
+        // 以及 `ACT_GENERATE` / `SEG_GENERATE` / `FIELD_ACT` 三个常量。
+        //
+        // **手表端「一句话创建人设」（PersonaFactory / PersonaWaitScreen）不受影响** ——
+        // 用户删的是**手机网页上的生成**，手表上那条路还在。
+        //
+        // ⚠️ **保留 `/gen` 路由的 404 行为**：老浏览器书签 / 历史记录如果还存着
+        // 编辑页带 formaction 的旧 URL，点进去会 404 —— 这是对的
+        //（功能没了就该 404，不要渲染出一个「按钮失效」的页面）。
         if (route == "$listPath/new") {
             val submitted = parseForm(body, PERSONA_FORM_FIELDS).toPersona(blankPersona())
-            if (submitted.act == ACT_GENERATE) {
-                generateAndRender(sock, submitted.persona)
-                return
-            }
             val created = submitted.persona.copy(
                 id = UUID.randomUUID().toString(),
                 // 「当初那句原始描述」在手机端没有单独一格，最接近的就是用户写的
@@ -314,9 +350,7 @@ class KeyImportServer(
         }
 
         if (route.startsWith("$listPath/")) {
-            val rest = route.removePrefix("$listPath/")
-            val isGenerate = rest.endsWith("/$SEG_GENERATE")
-            val id = rest.removeSuffix("/$SEG_GENERATE")
+            val id = route.removePrefix("$listPath/")
 
             // 角色已经不在了（手表上删过）：给他一条回得去的路，而不是 404。
             val existing = personas.find(id)
@@ -329,10 +363,6 @@ class KeyImportServer(
             // 身份信息（id / 建立时间 / 排序时间 / 来源 / 那句简介）不在表单上，
             // 也就不是「用户提交的内容」，原样留着。
             val submitted = parseForm(body, PERSONA_FORM_FIELDS).toPersona(existing)
-            if (isGenerate || submitted.act == ACT_GENERATE) {
-                generateAndRender(sock, submitted.persona)
-                return
-            }
             saveOrRender(sock, submitted.persona)
             return
         }
@@ -352,46 +382,6 @@ class KeyImportServer(
         // 303 而不是直接把列表页当 POST 的响应：POST 的响应留住的话，
         // 用户在手机上往下拉一把就会触发「要重新提交表单吗」。
         redirect(sock, "$listPath?saved=1")
-    }
-
-    /**
-     * 「用 AI 生成一份」：拿用户填的那句描述（没有就用名字 + 一句简介）走
-     * [PersonaFactory] 同一套 meta prompt，**把结果回填进表单**让用户逐块改。
-     *
-     * 复用 `PersonaFactory` 是硬要求，不是顺手：手表造的人和手机造的人必须走同一条
-     * 管道、同一套字段，否则会出现两种质量。
-     */
-    private suspend fun generateAndRender(sock: Socket, current: Persona) {
-        val seed = current.generationSeed()
-        if (seed.isEmpty()) {
-            respond(
-                sock,
-                personaFormHtml(
-                    current,
-                    error = "先写一句「人格内核」，或者把「角色名」填上，模型才有东西可扩写。",
-                ),
-            )
-            return
-        }
-
-        val result = personas.generate(seed)
-        val done = result as? PersonaResult.Done
-        if (done == null) {
-            val hint = (result as? PersonaResult.Failed)?.hint
-                ?: "生成被中断了，再点一次试试。"
-            respond(sock, personaFormHtml(current, error = hint))
-            return
-        }
-
-        // 只回填表单上那七格，**id 还是原来的**：编辑时不能因为生成一次就换个人；
-        // 新增时它本来就是空的，生成完仍然是「还没存到手表上」的状态。
-        respond(
-            sock,
-            personaFormHtml(
-                done.persona.copy(id = current.id),
-                notice = "生成好了，下面是模型给的版本。还没保存 —— 逐块改完再点最下面的「保存到手表」。",
-            ),
-        )
     }
 
     /**
@@ -419,7 +409,6 @@ class KeyImportServer(
             examples = this["examples"].orEmpty(),
             greeting = this["greeting"].orEmpty(),
         ),
-        act = this[FIELD_ACT].orEmpty(),
     )
 
     /** 新增时那份空表单。`id` 为空 == 还没存到手表上。 */
@@ -467,6 +456,17 @@ class KeyImportServer(
      *
      * 为什么限定得这么死：用户自己选过别的档（之前不是「系统」）就绝不覆盖；
      * 而且这个动作会**明写在成功页上**（「另外把识别引擎切到了讯飞听写」），不是暗改。
+     *
+     * ⚠️ **1.982 加回 `GENERIC` 之后，这里要不要给通用接口也加一条同样的自动切换？**
+     * **不加**，理由三条：
+     *  1. [asrUrl] / [asrModel] **永远有默认值**（预填硅基流动那套），所以「地址非空」
+     *     这件事**恒真** —— 拿它当触发条件，等于用户一打开这一页、什么都不改点保存，
+     *     引擎就被悄悄从「系统」改成「通用接口」，而那个地址他多半用不了。
+     *     这是「暗改」，正好踩在这段注释要防的那条线上；
+     *  2. 讯飞那条能自动切，是因为「三样齐全」是一个**用户刚刚亲手做出来的、
+     *     信息量很高的动作**；通用接口没有对应强度的信号；
+     *  3. 用户要的是「**能选**三档」，不是「自动替他选」。档位在下拉框里明摆着，
+     *     他自己选一下就好。
      */
     private fun withAutoEngine(
         before: ImportedCredentials,
@@ -511,8 +511,39 @@ class KeyImportServer(
                 "选了「讯飞听写」，但三样凭证没填齐（缺 ${missingXfyun(c)}）。" +
                     "不用讯飞的话，把上面的「识别引擎」改成「系统」再保存。"
 
+            // ---- 通用接口（1.982 加回来）----
+            // 这一档**只校验地址格式**，两项刻意不校验：
+            //  * Key 可以是空的（本机 whisper.cpp / faster-whisper 不鉴权，
+            //    卡它会直接把这条路堵死）；
+            //  * 模型名可以是空的（服务端有自己的默认值，而且各家模型名天差地别，
+            //    这里没有一张能拿来说「你这个不对」的表）。
+            engine == AsrEngine.GENERIC && !looksLikeAsrUrl(c.asrUrl) ->
+                "「通用接口」的地址要以 http:// 或 https:// 开头，而且要带全路径" +
+                    "（比如结尾的 /v1/audio/transcriptions）。换成别的档的话，" +
+                    "把上面的「识别引擎」改一下再保存。"
+
             else -> null
         }
+    }
+
+    /**
+     * 通用接口的地址。判据**刻意只做两件事**，和讯飞那三串同一个尺度
+     * （「看着不像半截串」就行，真能不能用点一次识别就知道）：
+     *
+     *  1. 非空 —— 空地址这一档根本没法用（`Settings.speechReady` 也是这么判的），
+     *     而它在表单上是一格**预填了默认值**的输入框，清空它是一个明确的动作；
+     *  2. 以 `http://` 或 `https://` 开头 —— 这是 `SpeechClient` **真的会抛错**的那一条
+     *     （它会抛「接口地址要以 http:// 或 https:// 开头」）。在这里先拦，
+     *     用户看到的是「哪一格填错了」，而不是回到手表上按麦克风才发现。
+     *
+     * ⚠️ 不查主机名能不能解析、不查路径对不对 —— 那要发请求才知道，
+     * 而这一页的职责只是「把表上的字收下来」。
+     */
+    private fun looksLikeAsrUrl(url: String): Boolean {
+        val trimmed = url.trim()
+        return trimmed.isEmpty() ||
+            trimmed.startsWith("http://") ||
+            trimmed.startsWith("https://")
     }
 
     /** DeepSeek 的 Key 形如 `sk-` + 32 位十六进制；放宽到「sk- 开头且够长」即可。空串跳过。 */
@@ -558,9 +589,16 @@ class KeyImportServer(
             <h2>语音识别 · 说话用</h2>
             <label for="$FIELD_ASR_ENGINE">识别引擎</label>
             ${engineSelect(values.asrEngine)}
-            <p class="hint">两档选一个。「系统」不用配置，直接用设备自带的识别服务；
-            要用讯飞就选「讯飞听写」，下面三串填齐。三串一旦填齐、这一栏又还停在「系统」，
+            <p class="hint">三档选一个。「系统」不用配置，直接用设备自带的识别服务；
+            「通用接口」要自己填一个兼容 OpenAI 的识别地址（有实现在本机跑的，那种不用 Key）；
+            「讯飞听写」要把下面三串填齐。三串一旦填齐、这一栏又还停在「系统」，
             保存时会自动切到「讯飞听写」（结果页会写出来）。</p>
+            <h3>通用接口 <span class="opt">（选了它才需要填）</span></h3>
+            <p class="hint">录完整段再上传到你填的接口，所以它需要一个<b>能用的</b>识别接口。
+            地址要带全路径，结尾通常是 /v1/audio/transcriptions。</p>
+            ${field(FIELD_ASR_URL, "接口地址", values.asrUrl, "https://…/v1/audio/transcriptions")}
+            ${field(FIELD_ASR_KEY, "识别 Key", values.asrKey, "可留空（本机服务通常不鉴权）")}
+            ${field(FIELD_ASR_MODEL, "模型名", values.asrModel, "FunAudioLLM/SenseVoiceSmall")}
             <h3>讯飞听写 <span class="opt">（选了它才需要填）</span></h3>
             <p class="hint">边说边出字，说完立刻有结果。三串都在讯飞控制台「我的应用」里。</p>
             ${field(FIELD_XFY_APP_ID, "AppID", values.xfyAppId, "8 位十六进制")}
@@ -618,10 +656,12 @@ class KeyImportServer(
     /**
      * 角色表单：新增与编辑共用。
      *
-     * 「用 AI 生成一份」那颗按钮**和「保存到手表」在同一个 form 里**，靠 `name=act`
-     * 区分（编辑页还多带一个 `formaction` 指向 /gen 那条路由）。为什么不做成两个 form：
-     * 两个 form 就得把七格内容复制一份，用户在其中一个里面改了字、按另一颗按钮时
-     * 提交的却是另一份陈旧内容 —— 那种「我明明改了」的诡异比多写一个属性难查得多。
+     * ## ⚠️ 1.987：「用 AI 生成一份」按钮已删除（用户要求，见 [handlePost] 那条长注释）
+     *
+     * 原来表单顶部有第二颗提交按钮（`name=$FIELD_ACT value=$ACT_GENERATE`，
+     * 编辑页还带 `formaction` 指向 /gen），和「保存到手表」在同一个 form 里、靠 `act` 区分。
+     * 删掉之后 form 里只剩「保存到手表」一颗按钮 ⇒ 那套「act 区分两个动作」的
+     * 机制整个退场，`FIELD_ACT` 常量也删了（见 [PERSONA_FORM_FIELDS] 的注释）。
      */
     private fun personaFormHtml(
         form: Persona,
@@ -630,9 +670,6 @@ class KeyImportServer(
     ): String {
         val editing = form.id.isNotEmpty()
         val action = if (editing) "$listPath/${escapeHtml(form.id)}" else "$listPath/new"
-        // 新增那条路没有独立的 /gen 路由（规范里只有 /p/{id}/gen），所以那颗按钮
-        // 只带 act=gen，由主路由自己认。编辑那条路带上 formaction 走规范指定的路由。
-        val genAction = if (editing) """ formaction="$listPath/${escapeHtml(form.id)}/gen"""" else ""
         val err = if (error == null) "" else """<p class="err">${escapeHtml(error)}</p>"""
         val note = if (notice == null) {
             ""
@@ -649,9 +686,6 @@ class KeyImportServer(
             <p class="sub">这里是 TA 的<b>全部人设</b>。六块都要写，缺一块扮演质量就掉一档。
             <b>留空哪一格，手表上那一格就变空</b>（不是「保持原样」）。</p>
             <form method="post" action="$action">
-            <button type="submit" name="$FIELD_ACT" value="$ACT_GENERATE"$genAction>✦ 用 AI 生成一份</button>
-            <p class="hint">先在下面「人格内核」写一句（或者只填个角色名），点这颗按钮让模型把它
-            扩写成六块，你再逐块改。生成的版本<b>不会自动保存</b>，改完还要点最下面的按钮。</p>
 
             ${field("name", "角色名", form.name, "周野（手表列表上显示的就是它）", "必填。手表列表的标题位只够 $PERSONA_NAME_MAX 个字，超了会被截断。")}
 
@@ -664,7 +698,7 @@ class KeyImportServer(
             ${textArea("greeting", "开场白", form.greeting, GREETING_HINT, "进聊天页时 TA 说的第一句。不要自我介绍，直接进入状态。留空会用一句「嗯，我在，你说。」。")}
             $err
             $note
-            <button type="submit" name="$FIELD_ACT" value="$ACT_SAVE">保存到手表</button>
+            <button type="submit">保存到手表</button>
             </form>
             <a class="btn tonal" href="$listPath">← 回到角色列表</a>
             <p class="foot">保存之后服务不会关，可以接着改下一个角色</p>
@@ -754,6 +788,16 @@ class KeyImportServer(
         val rows = listOf(
             "DeepSeek API Key" to c.apiKey.isNotBlank(),
             "识别引擎：${AsrEngine.fromKey(c.asrEngine).label}" to true,
+            // 通用接口三格（1.982 加回来）。这一页的价值就是「把保存后的完整状态摊开」，
+            // 少了这几行，选了通用接口的用户在这一页上**看不到自己那三格**，
+            // 也就失去了「核对有没有存错」的能力。
+            //
+            // ⚠️ 三行拆开列，**不做成「通用接口」一行**：Key 允许留空，
+            // 合并成一行的话「这一档配好了没有」就看不出来了 ——
+            // 而用户真正要核对的是「地址在不在」「Key 是不是空的（预期之内）」。
+            "通用接口 · 地址" to c.asrUrl.isNotBlank(),
+            "通用接口 · Key" to c.asrKey.isNotBlank(),
+            "通用接口 · 模型名" to c.asrModel.isNotBlank(),
             "讯飞 AppID" to c.xfyAppId.isNotBlank(),
             "讯飞 APIKey" to c.xfyApiKey.isNotBlank(),
             "讯飞 APISecret" to c.xfyApiSecret.isNotBlank(),
@@ -769,7 +813,16 @@ class KeyImportServer(
                 )
             }
             if (cleared) {
+                // ⚠️ 1.982 更正了这句话的适用范围：**「通用接口 · Key」那一行
+                // 留空是正常的**（本机服务不鉴权），它变成灰字并不代表出了问题。
+                // 原来只有讯飞三格时「灰色 = 空的 = 你少填了」是成立的，
+                // 加上通用接口之后不再成立，所以这里补一句把它说清 ——
+                // 否则用户会为了那一行不被标灰，硬去填一个他其实不需要的 Key。
                 append("""<p class="note">灰色那几项在手表上是空的。</p>""")
+                append(
+                    """<p class="note">其中「通用接口 · Key」空着是正常的 —— """ +
+                        """不填就不会发鉴权头，本机跑的识别服务通常正需要这样。</p>""",
+                )
             }
         }
         return """
@@ -860,27 +913,34 @@ class KeyImportServer(
         /** 表单字段名。手表端解析和手机端 HTML 两处必须一致，写成常量免得改一处漏一处。 */
         const val FIELD_API_KEY = "key"
         const val FIELD_ASR_ENGINE = "asr_engine"
+
+        /**
+         * 通用接口那三格的字段名。**1.982 随那一档一起加回来。**
+         *
+         * ⚠️ 加字段时容易漏的两处（症状都是「保存成功但那一格是空的」）：
+         *  1. [FORM_FIELDS] 白名单 —— 不在里面的 key 会被 [parseForm] **静默丢掉**；
+         *  2. 表单 HTML 里的 [field] 调用 —— 没有输入格，POST 里根本不会有这个 key。
+         */
+        const val FIELD_ASR_URL = "asr_url"
+        const val FIELD_ASR_KEY = "asr_key"
+        const val FIELD_ASR_MODEL = "asr_model"
+
         const val FIELD_XFY_APP_ID = "xfy_app_id"
         const val FIELD_XFY_API_KEY = "xfy_api_key"
         const val FIELD_XFY_API_SECRET = "xfy_api_secret"
 
-        /**
-         * 那颗提交按钮的名字。
-         *
-         * 角色表单上有两颗按钮（生成 / 保存），必须有个办法区分是谁按的。
-         * 用 `<button name=… value=…>` 是**唯一不依赖任何新特性**的做法 ——
-         * 被按的那颗按钮的 name/value 会跟着表单一起提交，这是 HTML 2.0 就有的行为。
-         */
-        const val FIELD_ACT = "act"
-        const val ACT_SAVE = "save"
-        const val ACT_GENERATE = "gen"
-
-        /** `/$token/p/{id}/gen` 的最后一段。 */
-        const val SEG_GENERATE = "gen"
+        // ⚠️ 1.987：FIELD_ACT / ACT_SAVE / ACT_GENERATE / SEG_GENERATE 四个常量
+        // 随「用 AI 生成一份」整条链路删除 —— 表单里只剩「保存到手表」一颗按钮，
+        // 不再需要 `act` 来区分（见 [handlePost] 与 [PersonaSubmission] 的注释）。
 
         val FORM_FIELDS = setOf(
             FIELD_API_KEY,
             FIELD_ASR_ENGINE,
+            // 通用接口三格（1.982 加回来）。⚠️ 漏加 = 手机上说保存成功、
+            // 手表上那三格纹丝不动（parseForm 只认白名单，其余静默丢掉）。
+            FIELD_ASR_URL,
+            FIELD_ASR_KEY,
+            FIELD_ASR_MODEL,
             FIELD_XFY_APP_ID,
             FIELD_XFY_API_KEY,
             FIELD_XFY_API_SECRET,
@@ -905,7 +965,8 @@ class KeyImportServer(
             "scenario",
             "examples",
             "greeting",
-            FIELD_ACT,
+            // ⚠️ 1.987：原来的 FIELD_ACT（act）随「用 AI 生成」删除而移出白名单 ——
+            // 表单里只剩「保存到手表」一颗按钮，POST 里不会再有 act=… 这个 key。
         )
 
         /**
@@ -964,30 +1025,21 @@ class KeyImportServer(
 }
 
 /**
- * 一次角色表单提交：**表单上那七格（角色名 + 人设六块）铺成的一份完整角色**
- * + 用户按的是哪颗按钮。
+ * 一次角色表单提交：**表单上那七格（角色名 + 人设六块）铺成的一份完整角色**。
  *
  * 值直接装在 [Persona] 里，不另立一个「表单值」类型：多一个中间类型就多一张
  * 「字段清单」，而两张清单迟早会有一张忘了改 —— 症状是「保存成功但那一格是空的」，
  * 很难查。映射只有一处，就是 [KeyImportServer] 里那个 `Map.toPersona`。
  *
  * [persona]`.id` 为空表示**这次是新增**（还没存到手表上）。
- */
-private data class PersonaSubmission(val persona: Persona, val act: String)
-
-/**
- * 拿去生成的那句描述。
  *
- * 优先用「人格内核」——用户手写的那一句才是他的本意；没写就退到「角色名 + 一句简介」，
- * 至少让模型知道要造谁。两者都没有就没什么可生成的。
+ * ## ⚠️ 1.987：`act` 字段删除
+ *
+ * 原来还有第二个字段 `act`（用户按的是哪颗按钮：「保存」还是「AI 生成」）——
+ * 随「用 AI 生成一份」整条链路删除（见 [handlePost] 那条长注释），
+ * 现在表单里只剩「保存到手表」一颗按钮，`act` 没有存在的意义了。
  */
-private fun Persona.generationSeed(): String {
-    val soulText = soul.trim()
-    if (soulText.isNotEmpty()) return soulText
-    return listOf(name.trim(), tagline.trim())
-        .filter { it.isNotEmpty() }
-        .joinToString("，")
-}
+private data class PersonaSubmission(val persona: Persona)
 
 /**
  * 所有手机页共用的样式表。原来只有凭证表单和成功页两张，各写一份还能忍；

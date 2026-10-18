@@ -55,8 +55,33 @@ data class XfyunConfig(
     val apiSecret: String,
     /** `zh_cn` 或 `en_us` */
     val language: String,
-    /** 断句静音时长，毫秒。手表上说短句，不用等太久 */
-    val eosMs: Int = 3000,
+    /**
+     * 断句静音时长，毫秒。
+     *
+     * ⚠️⚠️ **1.989：3000 → 10000（「经常不到 60 秒就断开」的修法）**
+     *
+     * 用户原话：「明明语音识别最长 60s，但经常不到 60s 就显示讯飞链接已断开」。
+     *
+     * ## 机理
+     *
+     * `eos` 是讯飞服务端的**断句静音阈值**：说话中间静音超过这个时长，
+     * 服务端就认为「这一句说完了」，**主动结束会话并断开连接**——
+     * 之后 [XfyunIat.runSession] 里 `socket.send()` 返回 false ⇒
+     * 用户看到「讯飞连接已断开」。**这不是网络问题，是服务端按 eos 规则收的尾。**
+     *
+     * 手表的使用场景是**想一句说一句**（说完一句要想下一句），中间停顿
+     * 3 秒太常见了——停一下就断，60 秒的上限根本用不到。
+     *
+     * ## 取值
+     *
+     * **10000ms 是讯飞文档允许的上限**。取上限而不是折中：
+     * 断开是不可恢复的（要重开整个会话），宁可「说完等一会儿才出结果」
+     * 也不要「想词的时候被掐」。
+     *
+     * ⚠️ 这**不延长** 60 秒录音上限（那是 [AudioRecorder.MAX_SECONDS] 管的本地时长），
+     * 两者独立。
+     */
+    val eosMs: Int = 10000,
 )
 
 /**
@@ -175,7 +200,11 @@ class XfyunIat {
             for (frame in frames) {
                 val status = if (sentAny) 1 else 0
                 if (!socket.send(frameMessage(config, seq, status, frame))) {
-                    throw SpeechException("讯飞连接已断开")
+                    // ⚠️ 1.989：文案改掉「已断开」——这个措辞听着像网络故障，
+                    // 实际最常见的原因是**服务端按 eos 规则收尾**（说话中间停顿
+                    // 超过 eos 就断）或单会话超时。eoc 上限已放宽到 10s（见
+                    // XfyunConfig.eosMs），残余场景再提示用户「再说一次」即可。
+                    throw SpeechException("这一段没接上，再说一次")
                 }
                 seq++
                 sentAny = true

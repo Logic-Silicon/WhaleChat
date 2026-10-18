@@ -36,8 +36,32 @@ private object Routes {
      * 跟从哪一页进来的没有关系（理由见 `DisplaySettingsScreen` 的类注释）。
      */
     const val SETTINGS_DISPLAY = "settings/display"
+
+    /**
+     * 「关于」二级页。1.978 新增 —— 设置页那一格从一段文字换成卡片，点进这一页。
+     *
+     * 和 [SETTINGS_SPEECH] / [SETTINGS_DISPLAY] 同级、同样**不带** `from` 参数：
+     * 这一页跟「从哪一页进来的」没有关系，从 ask 进设置和从 chat 进设置看到的是同一页。
+     *
+     * ⚠️ 它和 [SETTINGS] 的关系是「同前缀、不同路径」，**不受** [settings] 那个
+     * `settings?from=` 查询参数的影响 —— 后者是 `settings` 后面接 `?`，
+     * 这一条是后面接 `/about`，两条模板不会互相匹配。
+     */
+    const val SETTINGS_ABOUT = "settings/about"
     const val INPUT_API_KEY = "input/apikey"
     const val INPUT_PROMPT = "input/prompt"
+
+    /**
+     * 通用接口（OpenAI 兼容 ASR）的三格。1.982 加回来。
+     *
+     * ⚠️ 命名沿用 1.0 的 `INPUT_ASR_*`：这一档全应用统称「通用接口」，
+     * 但它在设置字段和 prefs 键上一直叫 `asr*`（`asrUrl` / `asr_url`），
+     * 路由跟着字段名走 —— 换个叫法只会多一处对不上的地方。
+     */
+    const val INPUT_ASR_URL = "input/asrurl"
+    const val INPUT_ASR_KEY = "input/asrkey"
+    const val INPUT_ASR_MODEL = "input/asrmodel"
+
     const val INPUT_XFY_APPID = "input/xfyappid"
     const val INPUT_XFY_APIKEY = "input/xfyapikey"
     const val INPUT_XFY_APISECRET = "input/xfyapisecret"
@@ -217,6 +241,24 @@ fun WhaleChatApp() {
                         onGenerate = { description ->
                             navController.navigate(Routes.personaWait(description, preset = true))
                         },
+                        // 成品预设（大肥鱼）：不联网、不生成，直接落库并进聊天页。
+                        //
+                        // ⚠️ 必须走 addBuiltinPersona（按 id 去重），**不能**直接
+                        // createPersonaChat —— 成品预设的 id 是写死的常量，直接追加
+                        // 会让「按两次添加」在通讯录里留下两条 id 相同的大肥鱼
+                        // （2026-10-18 实测踩到）。理由见 ChatEngine.addBuiltinPersona。
+                        //
+                        // popUpTo(HOME) 和等待页那条**逐字一致**：用户点完「添加」，
+                        // 最想看到的是 TA 开口；返回栈里不该留着预设页，否则从聊天页
+                        // 返回会退回到一张「添加」页，而用户以为已经加过了。
+                        onAddDirect = { persona ->
+                            val conversationId = ChatEngine.addBuiltinPersona(persona)
+                            if (conversationId.isNotEmpty()) {
+                                navController.navigate(Routes.chat(conversationId)) {
+                                    popUpTo(Routes.HOME) { inclusive = false }
+                                }
+                            }
+                        },
                     )
                 }
 
@@ -366,19 +408,35 @@ fun WhaleChatApp() {
                         },
                         onOpenSpeech = { navController.navigate(Routes.SETTINGS_SPEECH) },
                         onOpenDisplay = { navController.navigate(Routes.SETTINGS_DISPLAY) },
+                        onOpenAbout = { navController.navigate(Routes.SETTINGS_ABOUT) },
                     )
                 }
 
                 composable(Routes.SETTINGS_SPEECH) {
                     SpeechSettingsScreen(
+                        onBack = { navController.popBackStack() },
+                        // 通用接口三格（1.982 加回来）。和讯飞那三格走同一个输入页 ——
+                        // 只是 `InputTarget` 不同，标题/占位符/落盘各走各的分支。
+                        onEditAsrUrl = { navController.navigate(Routes.INPUT_ASR_URL) },
+                        onEditAsrKey = { navController.navigate(Routes.INPUT_ASR_KEY) },
+                        onEditAsrModel = { navController.navigate(Routes.INPUT_ASR_MODEL) },
                         onEditXfyAppId = { navController.navigate(Routes.INPUT_XFY_APPID) },
                         onEditXfyApiKey = { navController.navigate(Routes.INPUT_XFY_APIKEY) },
                         onEditXfyApiSecret = { navController.navigate(Routes.INPUT_XFY_APISECRET) },
                     )
                 }
 
+                // 「关于」二级页。**不带 `from`** —— 这一页对两个来源是同一份内容。
+                // 返回走 NavHost 默认的 popBackStack（返回手势和返回键都通）。
+                // ⚠️ 1.980 起这一页**多了一条返回路径**：底部那颗 M3E 贴边「返回」
+                // （`ScreenScaffold` 的 `edgeButton` 槽），它调的也是同一个
+                // `popBackStack()` —— 三条路都通，不是三个不同的落点。
+                composable(Routes.SETTINGS_ABOUT) {
+                    AboutScreen(onBack = { navController.popBackStack() })
+                }
+
                 composable(Routes.SETTINGS_DISPLAY) {
-                    DisplaySettingsScreen()
+                    DisplaySettingsScreen(onBack = { navController.popBackStack() })
                 }
 
                 composable(
@@ -411,8 +469,28 @@ fun WhaleChatApp() {
                     )
                 }
 
-                composable(Routes.INPUT_XFY_APPID) {
+                composable(Routes.INPUT_ASR_URL) {
                     InputScreen(
+                        target = InputTarget.AsrUrl,
+                        onDone = { navController.popBackStack() },
+                    )
+                }
+
+                composable(Routes.INPUT_ASR_KEY) {
+                    InputScreen(
+                        target = InputTarget.AsrKey,
+                        onDone = { navController.popBackStack() },
+                    )
+                }
+
+                composable(Routes.INPUT_ASR_MODEL) {
+                    InputScreen(
+                        target = InputTarget.AsrModel,
+                        onDone = { navController.popBackStack() },
+                    )
+                }
+
+                composable(Routes.INPUT_XFY_APPID) {                    InputScreen(
                         target = InputTarget.XfyAppId,
                         onDone = { navController.popBackStack() },
                     )

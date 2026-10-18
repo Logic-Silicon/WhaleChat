@@ -1,8 +1,10 @@
 package com.naoh.whalechat.ui
 
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -10,8 +12,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
@@ -24,6 +28,7 @@ import androidx.wear.compose.material3.ListSubHeader
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.ScrollIndicator
+import androidx.wear.compose.material3.SwitchButton
 import androidx.wear.compose.material3.Text
 import androidx.wear.compose.material3.TextToggleButton
 import com.naoh.whalechat.data.AsrEngine
@@ -42,14 +47,105 @@ import kotlinx.coroutines.launch
 private val DISPLAY_GROUP_GAP = 16.dp
 
 /**
+ * 「关于」这一组**之上**的空隙（1.982 新增）。
+ *
+ * 用户原话：「设置页底下清空对话的选项和关于靠太近了」。
+ *
+ * ## 根因
+ *
+ * `SettingsScreen` 的「数据」组（清空卡）和「关于」卡之间**什么都没有** ——
+ * 原来是靠一个 `ListSubHeader { Text("关于") }` 分开的，而那个组标题
+ * **1.978 特意删掉了**（它和卡片标题「关于 WhaleChat」重复）。
+ * 标题一走，两张卡之间只剩 `ScalingLazyColumn` 的默认项间距 **4dp**，
+ * 看起来就是「不相关的两张卡粘在一起」。
+ *
+ * ## 为什么取 16dp
+ *
+ * **与 [DISPLAY_GROUP_GAP] 一致**，理由是同一个：「这两处是不同类别，要断开」，
+ * 且与项目里已有的分组间距约定统一（组内项间距仍是列表默认 4dp）。
+ *
+ *  * 比组内项间距（4dp）明显大 ⇒ 能读出「换了一组」；
+ *  * 比页尾 `bottom_gap`（28dp）小 ⇒ 这是**组间**分隔，不是页尾留白，
+ *    两处加起来不会在圆屏底部堆出太多空白；
+ *  * 更大（24/28dp）会把「关于」卡再往下推 8~12dp，而这一页本来就长
+ *    （ask 来源尤其），首屏能看见的内容只会更少。
+ *
+ * ⚠️ **修法是把「要断开」交回给空隙本身，不是把组标题加回来** ——
+ * 那个标题是 1.978 明确删掉的（会显示成「关于 / 关于 WhaleChat」重复两次），
+ * 别顺手恢复。
+ *
+ * ⚠️ 它**不随 `origin` 分叉**：从 chat 进来时上面不是「数据」组而是别的组，
+ * 但这张关于卡**同样需要和上一组断开**，所以两处都给。
+ */
+private val ABOUT_GROUP_GAP = 16.dp
+
+/**
+ * 「清空对话」/「关于 WhaleChat」这两张**只有一行文字**的入口卡的高度。
+ *
+ * ## ⚠️⚠️ 这是本轮最典型的那个 Wear M3 公共陷阱
+ *
+ * `Card` 自带 `Modifier.cardSizeModifier()`（`Card.kt:929`）：
+ * ```kotlin
+ * private fun Modifier.cardSizeModifier(): Modifier =
+ *     defaultMinSize(minHeight = CardDefaults.Height)   // = CardTokens.ContainerMinHeight = 64.dp
+ * ```
+ * ⇒ **内容再矮也会被撑到 64dp**（@2.0 = 128px），
+ * 这正是用户说的「明明一行文字选项卡片却是两行高度」。
+ *
+ * ⚠️ **调 `contentPadding` 压不下去**：`Card` 的 `modifier` 是在
+ * `CardImpl` 里先 `.fillMaxWidth().surface().combinedClickable()` 再把
+ * `modifier` 接在**最前面**的（`CardImpl` 源码里 `modifier.fillMaxWidth()...`），
+ * 于是 `defaultMinSize(64.dp)` 作用在**外层、还要再受一次外层约束**，
+ * 把纵向内边距压到 0 也一样被撑到 64dp。
+ *
+ * ⚠️ **唯一有效杠杆是显式 `Modifier.height(h)`**：`Modifier.height` 是
+ * `SizeElement(enforceIncoming = true)`，它把**外层约束**钉成 min=max=h
+ * （`Size.kt` → `SizeNode.measure`：`enforceIncoming = true` 时用强制出的
+ * `targetConstraints`）。内层 `defaultMinSize` 的判据是
+ * `constraints.minHeight == 0`（`Size.kt:1085`，`UnspecifiedConstraintsNode`），
+ * 而外层已经把它抬到 h ≠ 0 ⇒ **`defaultMinSize` 直接让位**，卡片就是 h。
+ *
+ * ## ⚠️⚠️ 配套：给了高度就**必须**把 `contentPadding` 纵向一起压到 0
+ *
+ * 两件事缺一不可（1.978 踩过一次，症状是「整张卡画不出来」）：
+ * 卡片内部的 `Column` 先吃 `contentPadding`，`Text` 拿到的是**剩下的**高度。
+ * 默认纵向内边距是 12 + 12 = 24dp，`h = 48dp` 时留给文字只剩 24dp ——
+ * 加上 `titleMedium` 行盒 18sp（≈22dp）勉强够，再矮一点就是 **0 高、整个画不出来**
+ * （截图空白，`uiautomator dump` 里连节点都没有）。
+ *
+ * ⚠️ **`fillMaxWidth()` 也要在**：居中/换行依赖它给的确定宽度。
+ * 顺序上 `height` 与 `fillMaxWidth` 谁先谁后无所谓，但两个都要挂。
+ *
+ * ## 为什么是 48dp
+ *
+ * 这两张卡的内容都只有**一行** `titleMedium`：
+ * 行盒 = `lineHeight` 18sp ⇒ 18 × 2 = 36px @2.0 = **18dp**（墨迹更低，约 12dp）。
+ * `48 − 0（纵向内边距）= 48dp` 可用，是行盒的 2.7 倍 —— 量出来绝不会是 0 高。
+ *
+ * 为什么不取 [HomeScreen] 会话卡的 `56.dp`：那张卡是**两行**（标题 + 副标题），
+ * 56dp 是「内容自然高 54dp 再加 2dp」的结果；这里只有一行，
+ * 照抄 56dp 就等于把用户抱怨的「两行高度」从 64 换成 56，问题只解决了一半。
+ *
+ * 为什么不更矮（40dp）：圆屏上这块可点区域还要过 M3E 的触控与按压动效，
+ * 而且 48dp 是 M3 体系里通用的最小触控尺寸，**别再往下压**。
+ * 这个值**必须装机实测复核**（见报告：改前/改后高度 px）。 */
+private val SINGLE_LINE_CARD_HEIGHT = 48.dp
+
+/**
+ * 单行卡片的内边距。**横向照旧 12dp，纵向必须是 0** —— 理由见
+ * [SINGLE_LINE_CARD_HEIGHT] 的「配套」一段（纵向留着内边距会把文字挤成 0 高）。
+ */
+private val SINGLE_LINE_CARD_PADDING = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+
+/**
  * 「显示设置」二级页入口是否可见。
  *
  * ⚠️ **暂时隐藏**（「把显示设置隐藏（先不删）」）。
  * 代码、路由（`WhaleChatApp.SETTINGS_DISPLAY`）和 `DisplaySettingsScreen` **全部保留**，
  * 把这个常量改回 `true` 就能恢复入口 —— 这也是当初没有直接删掉的原因。
  *
- * 隐藏期间三个显示开关的值由 `SettingsStore` 的默认值 + 它的一次性覆盖
- * （`applyDisplayDefaults`）决定：**对话用量关 / 气泡时间开 / 角色列表用量开**。
+ * 隐藏期间三个显示开关的值由 `SettingsStore` 的默认值 + 它的**两次**一次性覆盖
+ * （`applyDisplayDefaults`）决定：**对话用量开 / 气泡时间开 / 角色列表用量开**。
  *
  * ⚠️ 恢复入口时，下面 `if` 块里那套排布约定（独立类别、
  * `GapItem` 必须**在组标题之上**、组标题「显示」与卡片「显示设置」**不同名**）
@@ -127,6 +223,11 @@ fun SettingsScreen(
      * 但形参和导航分支都保留（「先隐藏、不删」）。恢复入口时不用改签名。
      */
     onOpenDisplay: () -> Unit,
+    /**
+     * 打开「关于」二级页。1.978 新增 —— 原来那一格是本页里的一段文字，
+     * 现在只留一个入口。
+     */
+    onOpenAbout: () -> Unit,
 ) {
     val settings by ChatEngine.settings.state.collectAsStateWithLifecycle()
     // 订阅会话列表。以前这里直接读 ChatEngine.conversations.value —— 那不会触发重组，
@@ -275,33 +376,80 @@ fun SettingsScreen(
                 }
             }
 
-            item(key = "mode_hint") {
-                HintText(
-                    if (currentMode == ChatMode.THINKING) {
-                        if (isChatOrigin) {
-                            "先推理再接话：更贴合人设，但首字要等。回答里可以展开思考过程。"
-                        } else {
-                            "先推理再作答：答案更周全，但首字要等。回答里可以展开思考过程。"
-                        }
-                    } else {
-                        if (isChatOrigin) {
-                            "角色直接接话，最像真人聊天。上手最快的一档。"
-                        } else {
-                            "直接作答，最快的一档。日常问答够用，适合在手表上快点看完。"
-                        }
+            // ⚠️ 档位这一格下面原来挂着**两块**说明文字，**1.978 一起删掉了**：
+            //
+            //  1. `mode_scope_hint`（「只管这一页：Ask 和 Chat 各存一档，改一个不动另一个。」）
+            //     —— 用户原话「你的歧义点就是我想删的」。那句话本身就是先让人意识到有歧义、
+            //     再解释，反而把「两档独立」讲成了一个需要说明的特例。删掉后靠上面
+            //     `mode_header` 的标题（「Ask 档位 / Chat 档位」）承载同一件事。
+            //  2. `mode_hint`（两档各自的介绍，快答那档原话是「直接作答，最快的一档。
+            //     日常问答够用，适合在手表上快点看完。」）—— 用户原话「模型思考介绍文字删去」。
+            //     按「**整块 mode_hint 不再显示**」执行：**两档都不再出介绍**。
+            //     按钮自己的名字（快答 / 深度思考）已经把差别说清，多一段解释只是白占
+            //     圆屏首屏下面本来就紧张的那一屏。
+            //
+            // ⚠️ **两块都别再放回来**，也**不要**「只恢复其中一档」——
+            // 那会让从 ask 进来和从 chat 进来看到的这一页不一样长，
+            // 而这两个页面的其余部分是完全同构的。
+
+            // ★ 联网搜索（1.983）：**一级开关**，就摆在「模型」组里、档位下面。
+            //
+            // ## 为什么是「一级开关」而不是二级页
+            // 用户原话：「在设置里同样给**一级开关**放在模型设置那块」。
+            // ⇒ 直接一个 `SwitchButton` 摆在列表里，**不要再开二级页**
+            //（对比「显示设置」那三个开关：它们摆不下才收进二级页的）。
+            //
+            // ## 为什么按来源分叉（和档位同一套）
+            // 用户原话：「**chat 设置对应 chat 是否启用联网搜索，ask 就对应 ask**」。
+            // 判据与 `mode` 那一格**逐字相同**（都用上面那个 `isChatOrigin`），
+            // 落盘也是各写各的键（`search_ask` / `search_chat`）。
+            //
+            // ## ⚠️ 文案必须点明是 Ask 还是 Chat
+            // 这正是当年「档位」那一格踩过的坑（见上面那段长注释）：
+            // 用户看到「联网搜索」这一行时，**没有任何线索告诉他是哪一页的设置**，
+            // 于是会以为「改一个两边都变」。
+            // 所以 `secondaryLabel` 里必须出现 **Ask / Chat** 字样。
+            //
+            // ## ⚠️ 还必须让用户看到「它要额外花钱」
+            // 搜索是**按次计费**的（官方 5 元 / 1000 次）。用户有权知道开这个开关
+            // 会让每次提问多花一次钱。圆屏窄，所以压成极短的一句「按次计费」。
+            //
+            // ## ⚠️ 不要写解释性文案
+            // 不要写「改一个不动另一个」那种说明 —— `SettingsScreen.kt` 原来那条
+            // `mode_scope_hint` 就是被用户删掉的（原话「你的歧义点就是我想删的」）。
+            // 靠「Ask / Chat」字样自己说清，别去解释「它们是独立的」。
+            val searchOn = if (isChatOrigin) settings.searchChat else settings.searchAsk
+            val setSearch: (Boolean) -> Unit = { on ->
+                if (isChatOrigin) ChatEngine.settings.setSearchChat(on)
+                else ChatEngine.settings.setSearchAsk(on)
+            }
+
+            item(key = "search") {
+                SwitchButton(
+                    checked = searchOn,
+                    onCheckedChange = setSearch,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = {
+                        // ⚠️ label 只放四个字「联网搜索」—— 实测把「· 按次计费」也塞进 label
+                        // 会在这块圆屏上**从词中间折行**（「联网搜索 · 按次计」/「费」），
+                        // 很难看。「按次计费」挪到 secondaryLabel 里，那里本来就是小字。
+                        Text(
+                            text = "联网搜索",
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                    },
+                    secondaryLabel = {
+                        // ⚠️ 1.986：副标题固定成「由 Deepseek 提供搜索结果并按次收费」
+                        //（用户原话，**不随开关状态变**）—— 说清「谁在提供服务」和「要花钱」。
+                        // Ask/Chat 的归属由上面的「Ask 档位 / Chat 档位」标题承载。
+                        Text(
+                            text = "由 Deepseek 提供搜索结果并按次收费",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     },
                 )
             }
-
-            // ⚠️ 这里原来有一条固定说明 `mode_scope_hint`（「只管这一页：Ask 和 Chat
-            // 各存一档，改一个不动另一个。」），**已按用户要求删除**：
-            // 原话是「你的歧义点就是我想删的」——
-            // 那句话本身就是先让人意识到有歧义、再解释，反而把「两档独立」这件事
-            // 讲成了一个需要说明的特例。删掉后靠上面 `mode_header` 的标题
-            // （「Ask 档位 / Chat 档位」）承载同一件事，不再挂说明文字。
-            // **别再把它加回来。**
-            // 注意 `mode_hint` 不删：它解释的是**两档之间的区别**（快答 vs 深度思考），
-            // 不是两页之间的关系，跟着档位变，是这一页该有的东西。
 
             // 「系统提示词」只管 ask。chat 那边的 prompt 是**人设六块 + CHAT_OUTPUT_RULES**
             // 每次发送时现拼的（见 `ChatEngine.startStream`），全局这一套**根本不参与** ——
@@ -328,8 +476,13 @@ fun SettingsScreen(
             item(key = "speech") {
                 ActionCard(
                     title = "识别引擎",
+                    // ⚠️ 穷尽 `when`：1.982 加回 `AsrEngine.GENERIC` 之后**必须补这一档**，
+                    // 否则编译不过（这也正是我们想要的 —— 编译器帮着抓漏）。
+                    // 副标题只写「哪一档 + 它的特点」，**不写「不用配置」之类的操作指引**：
+                    // 这一页是入口，具体怎么配在二级页里。
                     subtitle = when (settings.asrEngine) {
                         AsrEngine.SYSTEM -> "系统识别 · 不用配置"
+                        AsrEngine.GENERIC -> "通用接口 · 自己填地址"
                         AsrEngine.XFYUN -> "讯飞听写 · 边说边出字"
                     },
                     icon = AppIcons.Mic,
@@ -355,21 +508,62 @@ fun SettingsScreen(
                 item(key = "data_header") { ListSubHeader { Text("数据") } }
 
                 item(key = "clear") {
+                    // ⚠️⚠️ 1.982：`height` + `contentPadding` 纵向 0 **两件事缺一不可**，
+                    // 理由（`Card` 自带的 `defaultMinSize(64.dp)` 陷阱）见
+                    // [SINGLE_LINE_CARD_HEIGHT] 那段长注释。少给任何一样都会出事：
+                    //  * 只给 `height` 不给 `contentPadding` ⇒ 纵向 24dp 内边距吃掉内容，
+                    //    `Text` 量成 0 高、**整张卡画不出来**；
+                    //  * 只给 `contentPadding` 不给 `height` ⇒ `defaultMinSize` 照样撑到 64dp，
+                    //    用户抱怨的「一行文字两行高度」一点没改。
                     Card(
                         onClick = { confirmClear = true },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(SINGLE_LINE_CARD_HEIGHT),
+                        contentPadding = SINGLE_LINE_CARD_PADDING,
                         colors = CardDefaults.cardColors(
                             containerColor = MaterialTheme.colorScheme.surfaceContainer,
                             contentColor = MaterialTheme.colorScheme.error,
                         ),
                     ) {
-                        Text(
-                            // 空白的新对话不算记录，条数里也不该有它们
-                            text = "清空所有对话 · 共 ${conversations.count { it.messages.isNotEmpty() }} 条",
-                            style = MaterialTheme.typography.titleMedium,
-                            modifier = Modifier.fillMaxWidth(),
-                            textAlign = TextAlign.Center,
-                        )
+                        // ⚠️⚠️ 1.982 补：**必须外面套一个撑满的 `Box` 并给 `contentAlignment`**，
+                        // 光靠 `Text` 自己是垂直居中不了的。
+                        //
+                        // 第一版只给了 `Text(modifier = fillMaxWidth(), textAlign = Center)`，
+                        // 实测 **上空隙 0px / 下空隙 53px** —— 文字贴在卡片上沿。
+                        // 根因：纵向 `contentPadding` 被压到 0 之后，`Card` 内部那个
+                        // `Column`（默认 `Arrangement.Top`）里就再没有东西把文字往下推，
+                        // 多出来的高度**全落在文字下面**。
+                        // **「卡片矮了」和「文字在卡片里居中」是两件事** —— 我上一轮只验了前者。
+                        //
+                        // 这里不用 `Text(fillMaxHeight)`：那只是把 `Text` 的**布局框**撑高，
+                        // 文字在框内落在哪儿是 `BasicText` 内部的事，不该靠猜。
+                        // 套 `Box` + `contentAlignment` 是**几何上确定**的居中。
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                // 空白的新对话不算记录，条数里也不该有它们
+                                text = "清空对话 · 共 ${conversations.count { it.messages.isNotEmpty() }} 条",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Center,
+                                // ⚠️ 1.978：卡片文案里去掉了「所有」两个字（原「清空所有对话 · 共 N 条」），
+                                // 并补上 `maxLines = 1` + Ellipsis。
+                                //
+                                // 原因：这个卡片的可用宽只有 214dp 出头，`titleMedium` 下
+                                // 「清空所有对话 · 共 999 条」已经超过一行 —— 而 Text 没有 maxLines
+                                // 时**只会换行不会裁字**，于是卡片凭空长高一行，
+                                // 把「数据」这一组整块往下顶，圆屏下沿开始切东西。
+                                // 三位数条数是日常状态（不是极端值），不能靠「用户不会存那么多」搪塞。
+                                //
+                                // 两道一起上：改短文案（正常情况根本不触发截断）+ maxLines 兜底
+                                // （真出现 5 位数也不会把版式顶歪）。**别再退回长文案。**
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                     }
                 }
             }
@@ -414,13 +608,50 @@ fun SettingsScreen(
                 }
             }
 
-            item(key = "about_header") { ListSubHeader { Text("关于") } }
+            // ⚠️ 1.978 第二轮：原来这里还有一个 `ListSubHeader { Text("关于") }` 分组标题，
+            // 和卡片标题重复（会显示成「关于 / 关于 WhaleChat」），已删。
+            // 这一组只有这一张卡，卡片自己写着「关于 WhaleChat」，分组标题纯属多余。
+            //
+            // ⚠️⚠️ **1.982 用户反馈：「设置页底下清空对话的选项和关于靠太近了」** ——
+            // 这就是上面那个组标题被删掉留下的**副作用**：
+            // 标题一走，清空卡和关于卡之间就什么都不剩了，
+            // 而 `ScalingLazyColumn` 的默认项间距只有 4dp（`spacedBy(4.dp)`）。
+            //
+            // 修法是**把「这一组要断开」这件事交回给空隙本身**（而不是把组标题加回来 ——
+            // 那个是 1.978 特意删的，见上一段，**别顺手恢复**）。
+            //
+            // 取值 [ABOUT_GROUP_GAP] = 16dp，**和 [DISPLAY_GROUP_GAP] 一致**，
+            // 理由是同一个：「这两处是不同类别，要断开」。组内项间距仍是列表默认的 4dp。
+            // 为什么不取更大：这一页末尾还有 `bottom_gap`(28dp)，
+            // 两处加起来在圆屏底部已经够空；16dp 刚好够断开、又不会把「关于」推出首屏。
+            item(key = "about_gap") { GapItem(ABOUT_GROUP_GAP) }
 
+            // 1.978：「关于」从一段三行的 `HintText` 换成**可点卡片**，点进二级页
+            // （`AboutScreen`）。位置没变 —— 还在「数据」组下面、「关于」标题底下那一格。
+            //
+            // ⚠️ 1.978 第二轮：**副标题删掉**（用户要求「下面的说明文字删去，就只有标题」）。
+            // 卡片上只剩标题「关于 WhaleChat」一行 —— 副标题原本写的是
+            // 「软件介绍 · 使用说明 · 开发人员」，属于「先替用户概括一遍里面有什么」，
+            // 而里面具体是什么用户自己会改（他自己的原话），概括反而是多余的噪音。
             item(key = "about") {
-                HintText(
-                    "非官方客户端，与 DeepSeek 官方无关。\n" +
-                        "API Key、识别凭证与聊天记录只存手表本机。\n" +
-                        "by NaOH",
+                ActionCard(
+                    title = "关于 WhaleChat",
+                    // 图标复用 AppIcons 里已有的对话气泡。
+                    // ⚠️ 它和「显示设置」入口那张卡是同一个图标 —— 那个入口当前**是隐藏的**
+                    // （`SHOW_DISPLAY_SETTINGS_ENTRY = false`），所以列表上看不到重复。
+                    // 哪天把那个入口放回来，这两张卡要有一个换图标，否则上下两张同图标会认不出。
+                    icon = AppIcons.Bubble,
+                    onClick = onOpenAbout,
+                    // ⚠️ 1.982：**两张单行卡一起压到同一高度**。
+                    // 用户只点了「清空对话」那张，但这两张卡现在**本来就一样高**
+                    // （都吃 `defaultMinSize(64.dp)`），只压一张会让下面这张莫名高出一截，
+                    // 看起来像没对齐 —— 比两张都高更难看。所以一起压，理由写在
+                    // [SINGLE_LINE_CARD_HEIGHT] 上。
+                    //
+                    // ⚠️ `AboutScreen` 里那四块 `AboutSection` 卡**不要动**：
+                    // 它们是多行正文，64dp 对它们是合理的；用户说的是**设置页这张入口卡**。
+                    modifier = Modifier.height(SINGLE_LINE_CARD_HEIGHT),
+                    contentPadding = SINGLE_LINE_CARD_PADDING,
                 )
             }
 

@@ -30,10 +30,12 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
-import androidx.wear.compose.material3.Button
-import androidx.wear.compose.material3.ButtonDefaults
+// ⚠️ 1.992：`ButtonDefaults` 随扫码页 EdgeButton 的显式配色删除而移除
+//（五处贴边按钮统一默认配色，见 edgeButton 槽里的注释）。
 import androidx.wear.compose.material3.Card
 import androidx.wear.compose.material3.CardDefaults
+import androidx.wear.compose.material3.EdgeButton
+import androidx.wear.compose.material3.EdgeButtonSize
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.ListHeader
 import androidx.wear.compose.material3.MaterialTheme
@@ -48,9 +50,6 @@ import com.naoh.whalechat.data.ImportedCredentials
 import com.naoh.whalechat.data.KeyImportServer
 import com.naoh.whalechat.data.Persona
 import com.naoh.whalechat.data.PersonaBridge
-import com.naoh.whalechat.data.PersonaFactory
-import com.naoh.whalechat.data.PersonaResult
-import com.naoh.whalechat.data.PersonaSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -133,6 +132,12 @@ fun ImportKeyScreen(landing: String, onDone: () -> Unit) {
                 ImportedCredentials(
                     apiKey = s.apiKey,
                     asrEngine = s.asrEngine.key,
+                    // 通用接口三格（1.982 加回来）。⚠️ 漏了这三行，手机页面上
+                    // 那三格永远是"空"的 —— 而这一页的语义是**整屏覆盖**，
+                    // 于是用户每来一次、点一次保存，手表上那三格就被清空一次。
+                    asrUrl = s.asrUrl,
+                    asrKey = s.asrKey,
+                    asrModel = s.asrModel,
                     xfyAppId = s.xfyAppId,
                     xfyApiKey = s.xfyApiKey,
                     xfyApiSecret = s.xfyApiSecret,
@@ -149,26 +154,10 @@ fun ImportKeyScreen(landing: String, onDone: () -> Unit) {
                 override suspend fun save(persona: Persona): String? =
                     ChatEngine.savePersonaFromPhone(persona)
 
-                override suspend fun generate(description: String): PersonaResult {
-                    val apiKey = ChatEngine.settings.value.apiKey
-                    if (apiKey.isBlank()) {
-                        return PersonaResult.Failed(
-                            "手表上还没填 DeepSeek API Key。先回「改凭证」那一页填上，再回来生成。",
-                        )
-                    }
-                    // **复用 PersonaFactory，不另写一套生成** —— 手表造的人和手机造的人
-                    // 必须是同一条管道、同一套字段，否则会出现两种质量。
-                    //
-                    // 这里开完令牌立刻作废，不留一个「活着」的令牌在全局飘着：
-                    // 手机端这一次生成不需要「离开 = 取消」那套语义（HTTP 响应就是这个
-                    // 事务的终点，用户关掉网页也退不了钱），而那个令牌是手表等待页的东西。
-                    val own = PersonaFactory.begin()
-                    return try {
-                        PersonaFactory.generate(apiKey, own, description, PersonaSource.CUSTOM)
-                    } finally {
-                        PersonaFactory.abandon(own)
-                    }
-                }
+                // ⚠️⚠️ 1.987：`generate()` 从这个桥里删除 —— 手机端「用 AI 生成人设」
+                // 整条链路移除（用户要求），表单里只剩「保存到手表」一颗按钮。
+                // **手表端「一句话创建人设」不受影响**（PersonaFactory / PersonaWaitScreen
+                // 那条路还在）。PersonaFactory 在本文件里已无引用，import 一并删除。
             },
         )
     }
@@ -217,6 +206,38 @@ fun ImportKeyScreen(landing: String, onDone: () -> Unit) {
     val listState = rememberScalingLazyListState()
     ScreenScaffold(
         scrollState = listState,
+        edgeButtonSpacing = BackEdgeButtonSpacing,
+        // 1.978：底部那颗按钮换成 Wear M3 的 **EdgeButton**（M3E 的「贴边底部按钮」——
+        // 形状跟着圆屏下沿走、整条占满屏宽、钉在屏幕底部）。
+        //
+        // 原来那颗是列表里的一个普通 `Button`（`ButtonDefaults.shape` 是**绝对**半径
+        // 26dp，在 48dp 高的小按钮上就是那个已知的「歪鸭蛋」），被当成普通列表项排在最下面。
+        // `EdgeButton` 才是这一版 M3 Expressive 里「一个页面最重要的那一个动作」的标准形态，
+        // 而且它自带「内容不会被它压住」的那套边距计算（`edgeButtonSpacing`）——
+        // 用它之后这一项可以从列表里整个拿掉，列表底部也不再需要自己留 28dp。
+        //
+        // 用 `EdgeButtonSize.Small`（56dp，允许两行）：够放下两个字，
+        // 又不至于把上面本来就紧的内容再挤一屏。
+        edgeButton = {
+            EdgeButton(
+                onClick = onDone,
+                // ⚠️ 官方 Wear Lists 指南示例里就有的那一句，五处贴边按钮一个都不能漏。
+                modifier = Modifier.edgeButtonScrollable(listState),
+                buttonSize = EdgeButtonSize.Small,
+                // ⚠️ 1.992：原来这里显式指定 `surfaceContainer` / `onSurface` 配色，
+                // 是五处贴边按钮里**唯一**不一致的一颗 —— 1.980 新增其它四页时
+                // 明确知道不一致但没回头改，本轮补上（走默认 `primary` / `onPrimary`，
+                // 与聊天页/设置各页/关于页一致）。见 DisplaySettingsScreen 那边的注释。
+                //
+                // ⚠️ `buttonSize = Small` **留着**：那是尺寸不是颜色，
+                // 扫码页内容本来就紧，不在本轮范围。
+            ) {
+                // 1.978：文案从「取消」改成「返回」。
+                // 「取消」会让人以为「这一趟白跑了、什么都没发生」，
+                // 而这个页面真正的语义只是「回到上一页」—— 改完直接退出去就行。
+                Text("返回")
+            }
+        },
         scrollIndicator = { ScrollIndicator(state = listState) },
     ) { contentPadding ->
         ScalingLazyColumn(
@@ -297,18 +318,25 @@ fun ImportKeyScreen(landing: String, onDone: () -> Unit) {
                         // 从 chat 进来的用户眼下要改的是人设，跟他讲「也能改凭证」
                         // 只会让他多读一行无关的字。落在某一个人身上时又不一样 ——
                         // 那一页上没有「新增角色」，说它有等于让人去找一个不存在的按钮。
+                        //
+                        // ⚠️ 1.978：三段各压成**一句短的**（原来每段都两三行）。
+                        // 圆屏上这段一长，下面的二维码和状态就被挤出首屏，
+                        // 而用户点进来唯一要做的事就是「拿出手机扫」。
+                        // 只保留「能改什么」这一件事，服务端的细节不在这复述。
                         when (target) {
                             PhoneTarget.CREDENTIALS ->
-                                "打开后能看到这块表上的全部凭证（对话 Key 和语音识别凭证），" +
-                                    "直接在上面改或删；也能新增角色、改角色的人设。"
+                                // 1.982：这一档多了「通用接口」三格（接口地址 / Key / 模型名），
+                                // 所以「全部凭证」这句现在**名副其实**了 —— 三套东西
+                                // （DeepSeek Key、通用接口三格、讯飞三串）都在这张表上。
+                                // 不提「识别」二字是因为它是三套里更大的一类统称，
+                                // 而这一页的副标题本来就写着「全部凭证」。
+                                "打开后能看和改这块表上的全部凭证。"
 
                             PhoneTarget.PERSONA_LIST ->
-                                "打开后能新增角色、改六块人设（人格内核 / 风格 / 规矩 / 场景 / " +
-                                    "示例对话 / 开场白），也能让模型按一句描述先生成一份再逐块改。"
+                                "打开后能新增角色、改六块人设。"
 
                             PhoneTarget.ONE_PERSONA ->
-                                "打开后是这个角色的六块人设（人格内核 / 风格 / 规矩 / 场景 / " +
-                                    "示例对话 / 开场白），改完直接返回。"
+                                "打开后能改这个角色的六块人设。"
                         },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -369,7 +397,10 @@ fun ImportKeyScreen(landing: String, onDone: () -> Unit) {
                                     // 「超时未收到」——那是凭证页才有的失败。
                                     "这一页已经关了，还要改就重开一次"
                                 } else {
-                                    "超时未收到，请取消后重试"
+                                    // 1.978：按钮从「取消」改成「返回」，这句跟着改 ——
+                                    // 否则同一页上一处说「取消」、一处说「返回」，
+                                    // 用户会去找一个不存在的按钮。
+                                    "超时未收到，请返回后重试"
                                 },
                                 style = MaterialTheme.typography.labelMedium,
                             )
@@ -378,17 +409,10 @@ fun ImportKeyScreen(landing: String, onDone: () -> Unit) {
                 }
             }
 
-            item(key = "cancel") {
-                Button(
-                    onClick = onDone,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
-                    ),
-                ) {
-                    Text("取消")
-                }
-            }
+            // 1.978：原来这里还有一项 `item(key = "cancel")`（一颗普通 `Button`，
+            // 文案「取消」）。已经搬到 `ScreenScaffold` 的 `edgeButton` 槽里去了
+            // （见上面 `EdgeButton(...)`），所以这里**不能再留一份** ——
+            // 两处都能点会让人以为「一个取消一个返回」，而它们干的是同一件事。
         }
     }
 }

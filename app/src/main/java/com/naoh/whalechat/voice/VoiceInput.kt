@@ -24,6 +24,7 @@ import androidx.core.content.ContextCompat
 import com.naoh.whalechat.data.AsrEngine
 import com.naoh.whalechat.data.ChatEngine
 import com.naoh.whalechat.data.Settings
+import com.naoh.whalechat.net.SpeechClient
 import com.naoh.whalechat.net.SpeechException
 import com.naoh.whalechat.net.XfyunIat
 import kotlinx.coroutines.CancellationException
@@ -60,9 +61,6 @@ data class VoiceInputHandle(
     val stopToEdit: () -> Unit,
     val phase: VoicePhase,
 
-    /** 0..1 的实时音量，只有 [VoicePhase.RECORDING] 期间有意义 */
-    val level: Float,
-
     /** 流式识别的中间结果，用来做「边说边出字」；批量接口这条恒为空 */
     val partial: String,
 
@@ -71,22 +69,26 @@ data class VoiceInputHandle(
 )
 
 /**
- * 语音输入。**讯飞识别优先，系统识别兜底。**
+ * 语音输入。**自己录音的两条路优先，系统识别兜底。**
  *
- * 两条路，按设置里选的那个走：
+ * **三条路**，按设置里选的那一档走：
  *
  * 1. **讯飞语音听写**（`AsrEngine.XFYUN`）—— 自己拿麦克风录音，按 1280 字节
  *    切片推给讯飞，**边说边出字**；说完等最后一片结果就行。
- * 2. **系统识别**（`AsrEngine.SYSTEM`）—— 拉系统面板，面板不可用就直连识别服务。
+ * 2. **通用接口**（`AsrEngine.GENERIC`）—— 自己录完整段，再 POST 给用户填的
+ *    任意 OpenAI 兼容 `/v1/audio/transcriptions`。**没有中间结果**（[VoiceInputHandle.partial]
+ *    这一档恒为空），所以要等到整段传完才有字。
+ * 3. **系统识别**（`AsrEngine.SYSTEM`）—— 拉系统面板，面板不可用就直连识别服务。
  *
- * 前一条存在的理由：系统那套 API 只把音频交给设备上装的 `RecognitionService`，
+ * 前两条存在的理由：系统那套 API 只把音频交给设备上装的 `RecognitionService`，
  * 跑在本地还是联网由厂商决定，**App 没有任何开关能指定**。在国内手机上这个服务
  * 往往就是 Google 的，于是表现为「经常报错 / 提示没有可用的识别 / 识别不准」——
  * 根因是它连不上，不是用户说得不清楚。
  *
- * 两条都不通就明确告诉用户，而不是静默失败。
+ * 三条都不通就明确告诉用户，而不是静默失败。
  *
- * @param onPartial 中间结果。讯飞那条是真流式，系统直连那条靠 `onPartialResults`。
+ * @param onPartial 中间结果。讯飞那条是真流式；**通用接口是批量，这条恒为空**
+ *   （这也是 [VoiceInputHandle.partial] 那句注释说的意思）；系统直连那条靠 `onPartialResults`。
  *   把它显示出来，用户能当场看出识别得对不对。
  * @param onEditResult 「录完先别发、拿去改字」这条出口（[VoiceInputHandle.stopToEdit]）。
  *   和 [onResult] 是同一趟识别的两个落点 —— 识别错字时，「重新说一遍」在手表上
@@ -107,6 +109,7 @@ fun rememberVoiceInput(
 
     val scope = rememberCoroutineScope()
     val recorder = remember { AudioRecorder() }
+    val speech = remember { SpeechClient() }
     val xfyun = remember { XfyunIat() }
 
     var phase by remember { mutableStateOf(VoicePhase.IDLE) }
@@ -124,8 +127,6 @@ fun rememberVoiceInput(
      * 这一整套对两个出口完全一样 —— 分的只是最后一脚往哪儿踢。
      */
     var editIntent by remember { mutableStateOf(false) }
-
-    val level by recorder.level.collectAsState()
 
     val direct = remember {
         DirectSpeechRecognizer(
@@ -149,6 +150,56 @@ fun rememberVoiceInput(
             return
         }
         if (editIntent) latestEdit(text) else latestResult(text)
+    }
+
+    /**
+     * 录完整段再上传。任何 OpenAI 兼容的批量接口都走这条（[AsrEngine.GENERIC]）。
+     *
+     * ## ⚠️ 这里**刻意不用** `supervisorScope`
+     *
+     * 讯飞那条（[runXfyun]）必须套 `supervisorScope`，是因为它把录音和识别**并发**跑了
+     * 两个 `async`，普通 `coroutineScope` 会让子协程的失败连坐取消整个作用域、
+     * 异常冒到 `rememberCoroutineScope()` 里那个 `launch` ⇒ **未捕获异常，进程直接挂掉**。
+     *
+     * 这一条是**串行**的（录完 → 传 → 收），压根没有兄弟协程可以连坐，
+     * 所以不要照抄那个结构 —— 抄了只会多一层看不懂的作用域。
+     *
+     * 但**「失败要立刻说」那条铁律照样要守**：网络错误由 [SpeechClient] 翻译成人话
+     * 之后抛 [SpeechException]，这里立刻把它交给 `latestMessage`。
+     * 失败绝不能吞掉、也不能让界面停在「正在识别…」上等超时 ——
+     * 那正是 1.0 实测过的坏症状（断网按麦克风后界面 22 秒什么都不说）。
+     *
+     * ## 去向
+     *
+     * 结果交给 [deliver] 而不是直接 `latestResult`：这一档同样要支持
+     * 「录完先别发、拿去改字」（[editIntent]，即对话页那支「去编辑」出口）。
+     */
+    suspend fun runGeneric(config: Settings) {
+        val wav = try {
+            recorder.record()
+        } catch (e: CancellationException) {
+            phase = VoicePhase.IDLE
+            throw e
+        } catch (e: Throwable) {
+            // 录音侧自己失败（麦克风被占 / 说得太短）。这是预期内的结果，报人话即可。
+            phase = VoicePhase.IDLE
+            latestMessage(e.message ?: "录音失败")
+            return
+        }
+
+        phase = VoicePhase.TRANSCRIBING
+        try {
+            deliver(speech.transcribe(config, wav))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: SpeechException) {
+            // 已知的、已经翻译成人话的失败：原样呈现（连不上 / Key 无效 / 明文 HTTP 被拦…）
+            latestMessage(e.hint)
+        } catch (e: Throwable) {
+            latestMessage("识别失败：${e.message ?: "未知错误"}")
+        } finally {
+            phase = VoicePhase.IDLE
+        }
     }
 
     /**
@@ -259,12 +310,19 @@ fun rememberVoiceInput(
         job = scope.launch {
             // 开录之后才读配置：用户完全可能刚在设置里改完就回来按麦克风。
             // beginRecording() 只在 speechReady 为真时才会被调到，而那一档只可能是
-            // 讯飞 —— 但引擎字段本身是可变的，真出了意外也不能让协程悄悄什么都不做。
+            // 两条自己录音的路（讯飞 / 通用接口）—— 但引擎字段本身是可变的，
+            // 真出了意外也不能让协程悄悄什么都不做。
+            //
+            // ⚠️⚠️ **1.982 这里最容易漏**：原来只判 `== XFYUN`，选了通用接口的用户
+            // 按麦克风会收到「识别引擎没配好，回设置里选一档」——而他明明配好了。
+            // 通用接口和讯飞一样是「自己录音」那条路，必须一起进 when。
             val config = ChatEngine.settings.value
-            if (config.asrEngine == AsrEngine.XFYUN) {
-                runXfyun(config)
-            } else {
-                latestMessage("识别引擎没配好，回设置里选一档")
+            when (config.asrEngine) {
+                AsrEngine.XFYUN -> runXfyun(config)
+                AsrEngine.GENERIC -> runGeneric(config)
+                // 走到这儿只可能是「开录之后引擎刚被改回系统」：界面上的麦克风
+                // 这会儿该走系统那条路，这一趟自己录的就没人要了，明确说一句。
+                AsrEngine.SYSTEM -> latestMessage("识别引擎没配好，回设置里选一档")
             }
         }
     }
@@ -300,7 +358,9 @@ fun rememberVoiceInput(
     fun start() {
         if (phase != VoicePhase.IDLE) return
         when {
-            // 自建识别排在第一位，这就是这套改造的全部意义
+            // 两条自己录音的识别排在第一位，这就是这套改造的全部意义。
+            // 判据用 speechReady —— 它对通用接口只要求地址非空（Key 允许空），
+            // 对讯飞要求三样齐全，别在这里另写一套判断。
             ChatEngine.settings.value.speechReady ->
                 if (hasRecordPermission(context)) beginRecording()
                 else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
@@ -349,7 +409,6 @@ fun rememberVoiceInput(
         stop = ::stop,
         stopToEdit = ::stopToEdit,
         phase = phase,
-        level = level,
         partial = liveText,
         listening = phase != VoicePhase.IDLE || systemListening,
     )

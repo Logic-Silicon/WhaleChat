@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -18,7 +17,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.wear.compose.material3.CircularProgressIndicator
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
@@ -154,10 +152,14 @@ fun PersonaWaitScreen(
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            // 用官方那个**不确定进度**的重载（不带 progress 参数）。
-            // 不覆盖 strokeWidth：默认值是和「推荐 gap 尺寸」配套算出来的，
-            // 手改粗细会让端点那个缺口比例失衡。
-            CircularProgressIndicator(modifier = Modifier.size(36.dp))
+            // M3E 的**波浪形圆形进度指示器**（移植 `material3_indicators` 的
+            // `WavyCircularProgressIndicator`，公式与动效时序逐条照搬 —— 见它的 KDoc）。
+            //
+            // 粗细/振幅不用手写：全按 `diameter` 的比例推（参考实现的 4/2/3 是对 48 逻辑像素而言的），
+            // 所以换尺寸时相对比例不变。
+            //
+            // 直径 56dp：这一段是整屏唯一的等待反馈，中间又是大块空白，大一点更好认。
+            WavyProgressIndicator(diameter = 56.dp)
 
             Text(
                 text = "正在塑造 TA…",

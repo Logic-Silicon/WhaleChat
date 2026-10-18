@@ -1,4 +1,4 @@
-import java.util.Properties
+﻿import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -49,6 +49,40 @@ val presetXfyApiSecret: String = prop("presetXfyApiSecret")
  */
 val presetAsrEngine: String = prop("presetAsrEngine")
 
+/**
+ * **联网搜索的基地址**（1.983 新增）。
+ *
+ * 为什么不写死在 Kotlin 里：`SearchClient` 需要一个**可测**的地址 ——
+ * 本地联调时得把它指到宿主上的假搜索服务，否则那条链路端到端根本没法验。
+ * 而它又**不该**变成用户能改的运行时设置（那是多一个可以被改坏的输入，
+ * 而且用户没有任何理由去改官方地址）。
+ *
+ * ⇒ 折中是**出包时注入的编译期常量**：
+ *  * **默认（不传参）= 官方地址**，release 与 debug 一样；
+ *  * 联调时 `-PsearchBaseUrl=http://127.0.0.1:8901` 指到假服务，**不用改源码**。
+ *
+ * ⚠️ **正式出包绝对不要带这个 -P 参数**（`build_release.sh` 里没有它）。
+ * 交付时会用 dex 字符串抽查核对包内是官方地址。
+ */
+val searchBaseUrl: String =
+    (project.findProperty("searchBaseUrl") as String?)?.takeIf { it.isNotBlank() }
+        ?: "https://api.deepseek.com"
+
+/**
+ * **对话 API 的基地址**（1.983 新增，同样是为了「可测」）。
+ *
+ * 默认 = 官方地址。存在的理由与 [searchBaseUrl] 一样：
+ * 要证明「搜索资料确实拼进了发给模型的请求」，就得让一个**假 chat 服务**
+ * 把收到的 body 原样打出来 —— 那是机理级证明，比看截图硬得多。
+ *
+ * ⚠️ 它**同时影响** `DeepSeekClient`（对话）与 `UsageStore`（余额查询）——
+ * 两者本来就共用同一个 base，一起指过去是符合预期的。
+ * ⚠️ 正式出包**绝不带**（`build_release.sh` 里没有它）。
+ */
+val chatBaseUrl: String =
+    (project.findProperty("chatBaseUrl") as String?)?.takeIf { it.isNotBlank() }
+        ?: "https://api.deepseek.com"
+
 /** 生成的 Java 字符串字面量。凭证里万一有引号/反斜杠，不转义会直接编不过。 */
 fun String.asLiteral(): String =
     "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
@@ -70,8 +104,12 @@ fun String.asLiteral(): String =
  *
  * （别用 `java.math.BigDecimal`：Kotlin DSL 里 `java` 这个名字被 JavaPluginExtension
  * 占了，`java.math` 会报 `Unresolved reference: math`。）
+ *
+ * ⚠️ **2.0 是正式版**（2026-10-18）。从 1.991 直接跳过来，跳过了中间那几个
+ * 没有出包的版本号 —— 这是有意的：2.0 是「阶段变化」的那一档，不是又一个 +0.001。
+ * 版本号的单调性由 versionCode 保证（2000 > 1991），装覆盖包不会失败。
  */
-val appVersionName = "1.976"
+val appVersionName = "2.0"
 val appVersionCode = appVersionName.split(".").let { parts ->
     require(parts.size == 2 && parts[0].toIntOrNull() != null) {
         "versionName「$appVersionName」不是「主.次」的写法（约定是 1.976 / 1.977 / 2.0 …）"
@@ -101,6 +139,13 @@ android {
         buildConfigField("String", "PRESET_XFY_APIKEY", presetXfyApiKey.asLiteral())
         buildConfigField("String", "PRESET_XFY_APISECRET", presetXfyApiSecret.asLiteral())
         buildConfigField("String", "PRESET_ASR_ENGINE", presetAsrEngine.asLiteral())
+
+        // 联网搜索的基地址（1.983）。默认官方地址；联调时用 -PsearchBaseUrl 覆盖。
+        // ⚠️ 用 asLiteral() 转义：用户传进来的 URL 里万一有引号/反斜杠，不转义会编不过。
+        buildConfigField("String", "SEARCH_BASE_URL", searchBaseUrl.asLiteral())
+
+        // 对话 API 的基地址（1.983）。同上，默认官方地址、联调时 -PchatBaseUrl 覆盖。
+        buildConfigField("String", "CHAT_BASE_URL", chatBaseUrl.asLiteral())
     }
 
     signingConfigs {

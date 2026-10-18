@@ -1,4 +1,4 @@
-package com.naoh.whalechat.ui
+﻿package com.naoh.whalechat.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -27,6 +27,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumnDefaults
+import androidx.wear.compose.foundation.lazy.ScalingParams
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.foundation.pager.HorizontalPager
 import androidx.wear.compose.foundation.pager.rememberPagerState
@@ -38,7 +40,6 @@ import androidx.wear.compose.material3.CardDefaults
 import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.HorizontalPagerScaffold
 import androidx.wear.compose.material3.Icon
-import androidx.wear.compose.material3.ListSubHeader
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.PagerScaffoldDefaults
 import androidx.wear.compose.material3.ScreenScaffold
@@ -52,23 +53,64 @@ import kotlinx.coroutines.delay
 /**
  * 顶部两个主操作按钮的尺寸。
  *
- * 这块屏是 480px @ density 320，也就是 **240dp** 见方 —— 圆屏半径只有 120dp。
- * 两个胶囊并排后总宽必须完整落在圆内：设按钮行中心距圆心 dy，则该高度处的
- * 可用半宽 = sqrt(120² - dy²)。
+ * ## ⚠️ 宽度：90dp → 70dp → **76dp**（两轮调整的理由都在这）
  *
- * 现在把按钮行抬到圆心上方约 56dp 处（top_gap=32 + 按钮半高 24 → 中心 dy≈56），
- * 该处可用半宽 ≈ sqrt(120² − 56²) ≈ 106dp，故安全总宽取 184dp：
- * 两栏各 90dp + 中间 4dp。高度 48dp，比初版（56dp）略小，更贴近参考 app 的轻盈感。
+ * **第二轮**：用户要求「适当做小上面的两个按钮，**尤其是水平方向做窄**」，
+ * 并给了另一款手表 app 的顶部按钮作参照（`Screenshot_20261011_074751_wysappmarket.png`）。
+ * 那张参考图 480×480，实测（`m978_top_btn.py`）：
+ *
+ * ```
+ *   左 146px × 高 97px ｜ 间隙 10px ｜ 右 146px      ⇒ 整行 302px
+ *   按 2.125 px/dp 换算：68.7dp × 45.6dp ｜ 间隙 4.7dp ｜ 整行 142dp ｜ 上沿 73px
+ * ```
+ *
+ * 照着收成 **70dp**（整行 144dp ≈ 参考的 142dp）。
+ *
+ * **第五轮**：用户问「和图例匹配吗」，量完的结论是**宽度已经和图例基本一致**
+ * （70 vs 68.7dp，还略宽 1.3dp），但用户仍要「适当做宽一小点点」。
+ * ⇒ 定 **76dp**（整行 156dp，+6dp/颗，+4%）。
+ *
+ * ## ⚠️ 加宽之前算过的余量（别凭感觉加，加到被切角就是恶性结果）
+ *
+ * ⚠️⚠️ **1.978 第一版就是被切了上角**（用户原话「显示不全」）。原因见下面「圆屏几何」那段的
+ * ⚠️ **关键修正**：卡住按钮的**不是**按钮行的上沿，而是它**上沿往下约 9dp 的那一行** ——
+ * 圆角半径 26dp **大于**半高 22dp，所以按钮顶边并不是「尖的」，顶边那一行就已经有相当的宽度了。
+ * 实测（70dp 时逐行量「整行半宽」与「圆屏在该行的允许半宽」之差）：
+ *
+ * ```
+ *   y=74（顶行）  画的半宽 113.5  允许 173.3   余量 +59.8px
+ *   y=94（最紧）  画的半宽 145.5  允许 190.5   余量 +45.0px   ← 瓶颈在这
+ *   y=120（最宽） 画的半宽 153.5  允许 209.0   余量 +55.5px
+ * ```
+ *
+ * 加宽 Δdp 只是把「画的半宽」在**每一行**上各加 Δ（圆角半径是绝对值，不随宽度变），
+ * 所以瓶颈那行还剩 `21dp − Δ`。**上限 ≈ 21dp/颗**（行宽 186dp）。
+ * 本轮取 **Δ = 6dp** ⇒ 瓶颈余量仍有 **+32px（≈15dp）**，留足了安全边。
+ * 320dpi 下同一处的余量更大（R=120dp），不构成更紧的约束。
+ *
+ * ## 高度保持 44dp 不动
+ *
+ * 参考图的高度是 45.6dp，本来就比我们高；用户说的「做小」指的是水平方向。
+ * 高度那一档还是提示词里「≈88px」（= 44dp @ 320dpi）。
+ *
+ * ## 圆屏几何（改宽度必须重算这条）
+ *
+ * 这块屏是 **240dp 见方**（模拟器 480px @ density 340）；取最不利密度时
+ * 圆屏半径只有 **112.9dp**。整行 144dp 全部落进圆里需要
+ * `2·sqrt(112.9² − (112.9−y)²) ≥ 144` ⇒ 上沿 ≥ 25.9dp —— 见 [TOP_GAP]。
+ *
+ * ⚠️ **判定要拿上沿那条弦**，不是行中心线（第一版就是栽在这，上角被切）。
  *
  * 注意 [TOP_ACTION_WIDTH] 是**静止**宽度。按下时 ButtonGroup 会让被按的那颗
- * 按 ExpansionWidth（默认 24dp）涨出去、旁边那颗同步缩回来，总宽始终 184dp ——
- * 所以圆屏几何这条约束不会被按坏。
+ * 按 ExpansionWidth（默认 24dp）涨出去、旁边那颗同步缩回来，总宽始终 144dp ——
+ * 所以圆屏几何这条约束不会被按坏。（70dp 的静止宽 + 24dp 展开 = 94dp，
+ * 两颗加起来仍然 144dp，不会顶到圆边。）
  *
- * **两页共用这四个常量**：第二页（通讯录）的按钮行和第一页几何完全相同，
+ * **两页共用这几个常量**：第二页（通讯录）的按钮行和第一页几何完全相同，
  * 差一个字都会让两页在左右滑动时跳一下。
  */
-private val TOP_ACTION_WIDTH = 90.dp
-private val TOP_ACTION_HEIGHT = 48.dp
+private val TOP_ACTION_WIDTH = 76.dp
+private val TOP_ACTION_HEIGHT = 44.dp
 
 /**
  * 两颗胶囊的间隙。
@@ -83,6 +125,202 @@ private val TOP_ACTION_ROW_WIDTH = TOP_ACTION_WIDTH * 2 + TOP_ACTION_GAP
 
 /** 顶部图标尺寸（比初版的 26dp 略小，配合更小的胶囊）。 */
 private val TOP_ACTION_ICON_SIZE = 22.dp
+
+/**
+ * 第一项留白：把两颗胶囊从屏幕最顶上「让」下来。
+ *
+ * ## ⚠️ 这个数由**圆屏几何**卡死，不能靠感觉调（1.978 第一版就栽在这）
+ *
+ * 两颗胶囊并排总宽 [TOP_ACTION_ROW_WIDTH] 是**矩形**，而屏幕是圆 ——
+ * 在高度 y 处只有 `2·sqrt(R² − (R−y)²)` 那么宽。
+ * **要点是拿按钮的「上沿」去比，不是拿按钮行的中心线去比**：
+ * 上沿那一行弦最窄，只要它放不下整行宽，两颗胶囊的**上角就会被圆边切掉**。
+ *
+ * 第一版把 `TOP_GAP` 压到 3dp（按钮上沿 ≈ 31dp），当时只按「行中心线」验算，
+ * 结果上角真的被切了（用户原话：「紧、还显示不全」）。
+ *
+ * 现在按上沿、取最不利密度（**340dpi ⇒ 屏幕半径只有 240px/2.125 = 112.9dp**）重算：
+ * ```
+ *   需要 2·sqrt(112.9² − (112.9 − y)²) ≥ 144dp  ⇒  y ≥ 25.9dp   （行宽 70+4+70）
+ * ```
+ * 第五轮按参考 app 对齐到 73px（`TOP_GAP = 7.4dp`），但那条带子被压到只剩 37px，
+ * 闪字被挤（第六轮反馈）⇒ **第七轮回调到 [TOP_GAP] = 10dp**：
+ * 按钮上沿 ≈ 37.2dp = **79px**（比参考图低 6px），带子 44px，闪字上下各留 10px；
+ * 该处弦宽 ≈ 168dp ≥ 156dp ✓（余量 12dp，仍远大于 0）。
+ * ⚠️ 往下挪同时会让圆屏弦**变宽**（y 越靠近圆心越宽），所以这一步是双赢：
+ * 闪字松了、圆边余量也多了。
+ * 320dpi（半径 120dp）下同一点弦宽 ≈ 168dp ✓。
+ *
+ * ⚠️ 它与 [TOP_ACTION_WIDTH] 一样是**两页共用**的，别只改一页。
+ * ⚠️ 它同时决定「模式提示」那条闪字能不能待在上面的空档里 —— 见 [MODE_FLASH_TOP]。
+ */
+private val TOP_GAP = 10.dp
+
+/**
+ * 顶部两颗胶囊与**下面第一块内容**（「最近对话」标题 / 第二页的首张角色卡）之间的间距。
+ *
+ * 1.976 是第一页 12dp、第二页 0dp；1.978 第一版把它整个删掉，想让内容尽量上提。
+ * **删过头了** —— 用户的反馈是「两按钮和最近对话/角色列表的间距太小了，看着很紧凑」。
+ * 现在两页都给 **10dp**（原来第二页是 0dp，最挤的就是页二）。
+ *
+ * ⚠️ 这个数是**上下都有代价**的：往上一格是按钮下沿、往下一格是内容。
+ * 调大它会把首卡和底部「共 N tokens」那行一起往下推 —— 首屏内容不多时
+ * 那行会被下边缘裁掉一部分。改之前先看 [MODE_FLASH_TOP] 和底部汇总那条注释。
+ */
+private val ACTIONS_GAP = 10.dp
+
+/**
+ * 列表里每张卡片的**内容内边距**和**固定高度**。
+ *
+ * 1.978 第三轮：用户要求「适当做小卡片显示面积」。这里动的是**盒子**，
+ * 字号、行距、层级一个字没改。
+ *
+ * ## ⚠️ 高度必须显式给 —— 这是 `ListSubHeader` 那个坑的**同一个**坑
+ *
+ * 第一版只把 `contentPadding` 的纵向从默认（约 11dp）收到 8dp，实测**卡片高度只小了 9px**：
+ *
+ * ```
+ *   改前 68dp(145px) → 给 8dp 内边距后 64dp(136px)   （只省了 9px，不是预期的 25px）
+ * ```
+ *
+ * 原因：`TitleCard` 和 `ListSubHeader` 一样带 `defaultMinSize(minHeight = 64.dp)`
+ * （`CardTokens.ContainerHeight`）。只要内容算出来**小于** 64dp，卡片就被撑在 64dp ——
+ * **内边距调得再小也没用**。杠杆仍然是那一个：**显式给高度**
+ * （`Modifier.height(h)` 把外层约束钉成 min=max，里面的 `defaultMinSize` 见 minHeight
+ * 已经不是 0，就不再抬上去）。
+ *
+ * ## 为什么是 56dp（不是更小，也不是 64dp）
+ *
+ * 这张卡片是「标题一行 + 副标题一行」，内容自然高度实测约 **54dp**
+ * （标题行盒 23dp + 副标题行盒 19dp + 两者之间那点间距 + 上下各 6dp 内边距）。
+ * 所以 56dp 是「内容放得下 + 只比内容多 2dp」的那个值：
+ *
+ *  * 再矮就**开始挤文字** —— 和 `ListSubHeader` 那个「标题整个画不出来」是同一类事故
+ *    （盒子小于 padding + 内容时，Text 会被量成 0 高）；
+ *  * 不给高度就永远是 64dp（= 136px），等于没改。
+ *
+ * 340dpi 实测：145px → **119px**，一屏多露约半张卡。
+ *
+ * ## ⚠️ 两页的卡片（会话 / 角色）**共用这两个值**
+ *
+ * 两页外观不一致的话，左右滑动的那一下会明显「一张卡片鼓出来」。
+ * 两张卡都是「两行」结构，所以同一个高度对两者都成立。
+ */
+private val CARD_CONTENT_PADDING = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+
+/**
+ * 卡片高度。**必须显式给**，理由见 [CARD_CONTENT_PADDING] 上面那段
+ * （`TitleCard` 自带 `defaultMinSize(64.dp)`，不给高度就永远 64dp）。
+ * ⚠️ 改它之前先量一下内容自然高度 —— 低于内容高度会把文字挤没。
+ *
+ * ## ⚠️⚠️ 1.986：**改回 56dp**（1.985 曾改到 50dp）
+ *
+ * 1.985 为了修「标题过于靠上」把卡高压到 50dp（贴合内容自然高 49.4dp），
+ * **用户实测：「最近对话和联系人卡片怎么改的好小，做回前几个版本大小」**。
+ *
+ * ## 1.986 的取舍：**回到 56dp + 用「卡内整体居中」解决「靠上」**
+ *
+ * 56dp 卡里内容自然高 105px、剩余 ~14px 被 `CardImpl` 的 `Column` 落到底部 ⇒ 偏上。
+ * 50dp 是「消灭剩余空间」；**56dp 下剩余空间仍在** ⇒ 改用另一个杠杆：
+ * `ConversationRow` 的 title 槽给 `Text` 挂 **`Modifier.align(Alignment.CenterVertically)`**
+ * （RowScope 的垂直居中，把 title 行盒在 Row 的可用高里居中；
+ * `Card.kt:1096` 那个 title Row 本身是 `Alignment.Top`，不挂就贴顶）。
+ * 副标题槽是 `ColumnScope`、没有垂直 align 可用 ⇒ 它保持不动
+ * （它贴在 title 行下面，title 下移之后整组观感已经回正）。
+ *
+ * **不影响 `ScalingLazyColumn` 缩放效果**（用户原话要求）：卡高只改这一张卡的
+ * 布局尺寸，缩放参数仍是 `HOME_SCALING`（`edgeScale = 0.6`），条目的
+ * 排布/缩放曲线一概没动 —— 缩放发生在 `graphicsLayer` 层，与 item 的固有高度无关。
+ */
+private val CARD_HEIGHT = 56.dp
+
+/** 底部「共 N tokens」汇总行离列表上一项的间距。理由见那个 item 里的注释（别删）。 */
+private val ASK_TOTAL_TOP_GAP = 12.dp
+
+/**
+ * 两页列表共用的缩放参数 —— **1.982 把「随滑动放大缩小」调明显了**。
+ *
+ * ## 用户原话
+ *
+ * > 「最近对话的卡片随滑动页面放大缩小显示的效果做的不够明显，
+ * >   稍微加强一点放缩变化的显示效果」
+ *
+ * ## 这个特性叫什么、旋钮是哪个（读库源码得出的确切答案，不是猜的）
+ *
+ * 官方名字是 **`ScalingLazyColumn` 的缩放效果**，参数是它构造参数里的
+ * **`scalingParams: ScalingParams`**。KDoc 原话（`ScalingLazyColumn.kt:755-759`）：
+ *
+ * > "Items in the ScalingLazyColumn have **scaling and alpha effects** applied to them
+ * > depending on their position in the viewport. The closer to the edge (top or bottom)
+ * > of the viewport that they are the greater the **down scaling and transparency** that is applied."
+ *
+ * ⇒ 「越靠屏幕上下沿，缩得越小、越透明；中间最大」，和用户描述完全一致。
+ *
+ * 缩放量的算法（`ScalingLazyColumnMeasure.kt:317-358`）：
+ * ```
+ * scaleToApply = lerp(1.0f, scalingParams.edgeScale, scalingInterpolated)
+ * ```
+ * ⇒ **`edgeScale` 是唯一的「缩放强度」旋钮**：`1.0` = 完全不缩，`0.7` = 缩到七成。
+ *
+ * ## 取值：0.7（库默认） → 0.6
+ *
+ * 库默认 `ScalingLazyColumnDefaults.scalingParams(edgeScale = 0.7f)`，用户说不够明显。
+ * 这里改成 **`0.6f`** —— 缩到六成，比默认明显一档。
+ *
+ * ⚠️ **只动 `edgeScale` 这一个变量**，理由：
+ *  * `edgeAlpha`（靠边时的透明度，默认 0.5）**刻意不动** —— 用户只说了「放大缩小」，
+ *    没提透明度。两个一起改，下次反馈「还是不够」时就分不清是哪一个起的作用，
+ *    也看不出该往哪边调；
+ *  * `minTransitionArea` / `maxTransitionArea`（默认 0.35 / 0.55）**刻意不动** ——
+ *    它们决定「从哪个位置开始缩」，动它们改变的是缩放的**起止范围**，
+ *    比动 `edgeScale` 副作用大得多（本页底部还有「共 N tokens」汇总行和翻页圆点，
+ *    1.976~1.978 为它们打过三四轮，**别再撞回去**）。
+ *
+ * 为什么不干脆给 0.5：小卡片上「忽大忽小」会读出眩晕感。先给 0.6，
+ * 明显但不过头；用户要更强再往下走。
+ *
+ * ## ⚠️ 应用范围：只给 HomeScreen 的两页（Ask 首页 + Chat 通讯录）
+ *
+ * 用户点名的是「**最近对话**的卡片」（Ask 首页）。**通讯录那一页也给**，理由：
+ * 两页是左右滑动切换的，缩放强度不一致会「跳一下」——
+ * 项目硬约定「两页的按钮行几何差一个字都会让两页在左右滑动时跳一下」，
+ * 同一页的两个面更不该有两套观感。
+ *
+ * **别的页面（ChatScreen / 各设置页）不给**：用户只提了「最近对话的卡片」；
+ * 而且那些页面（设置页那种）卡片本来就填满宽度，缩放只会让它们的边缘「抖」。
+ *
+ * ## ⚠️ 一条必须知道的性质
+ *
+ * `scalingParams` 只是**显示效果**（走 `graphicsLayer`），**不改变布局占位** ——
+ * 列表的可滚动高度、item 间距都不变，但视觉上靠边的卡片会变小、留白变多。
+ * item 位置由 `autoCentering`/锚点决定、缩放是之后套上去的，所以
+ * **理论上不影响底部那行汇总与翻页圆点** —— 但必须实测确认（见报告需求 3）。
+ */
+private val HOME_SCALING: ScalingParams = ScalingLazyColumnDefaults.scalingParams(
+    edgeScale = 0.6f,
+)
+
+/**
+ * ⚠️ 1.978 第三轮：`HEADER_HEIGHT` 与 `recentHeaderPadding` **已删除**。
+ *
+ * 它们是为「最近对话」那个 `ListSubHeader` 服务的；用户要求把那四个字删掉，
+ * 两个常量就没用了。**这里把踩坑记录留下**，因为这个坑以后还会有人踩：
+ *
+ *  * `ListSubHeader` 自带 `defaultMinSize(minHeight = 48.dp)`
+ *    （`ListSubHeaderTokens.Height`），而且里面的文字**在整块里垂直居中** ——
+ *    所以它上下那 16dp / 8dp 的 `contentPadding` 改了也没用（48dp 的下限压着），
+ *    文字中心恒在块顶下方 24dp。48dp 的块一摆下去，标题就被顶到屏幕中间
+ *    （这正是 1.976 及以前的现象）。
+ *  * 唯一的杠杆是**显式高度**：给 `Modifier.height(h)` 会把外层约束钉成 min=max，
+ *    里面的 `defaultMinSize(48.dp)` 见 minHeight 已经不是 0 就不再抬上去。
+ *  * ⚠️⚠️ **只给高度不够，`contentPadding` 必须一起改**（两件事缺一不可）：
+ *    它默认纵向内边距 16 + 8 = **24dp**，`wrapContentSize` 把内层 max 约束传下去之后
+ *    这 24dp 被内边距吃光，留给文字的高度是 **0** —— 标题不是「位置不对」，
+ *    是**整个画不出来**（实测：那一行全空，`uiautomator dump` 里连节点都没有）。
+ *
+ * ⇒ 本轮直接把这一块拿掉了：**能用「不给」解决的问题，就不要用「压尺寸」解决。**
+ * 拿掉之后按钮与列表之间那块空白由 [ACTIONS_GAP] 一处说了算。
+ */
 
 /**
  * 首页的两页。`ordinal` 直接当页码用，加一页只要在这里加一项
@@ -123,17 +361,46 @@ private const val MODE_FLASH_HOLD_MS = 2_000L
 /**
  * 模式提示文字的竖直落点。
  *
- * 实测（在 480×480 @ density 320 上抓图逐行数亮像素得到的）：
- *  * 时间胶囊占 y≈12–34px；
- *  * 顶部两颗胶囊占 y≈118–214px。
- * 中间 34–118px 整条是空的。文字用 labelLarge 放在 28dp 处，
- * 墨迹正好落在 y≈64–94px 一带 —— 也就是这条空档的**正中**。
+ * ## ⚠️ 它被按钮的位置来回搬过三次，最后一次是「搬回原处」
+ *
+ * 1.976 是 **28dp** —— 那时按钮行在 126px 起，文字在按钮**上面**那条空档里。
+ * 1.978 第一版把按钮抬到 64px 起，上面没地方了，于是挪到 75dp；
+ * 第二版按钮落到 109px 起，又挪到 96dp —— 那两次都只能**塞在按钮和内容之间的缝里**，
+ * 用户看到的就是「这行字从顶端跑下去了」。
+ *
+ * 第三轮（用户反馈后）：按钮宽 90dp → **70dp**，圆屏几何允许它重新上移，
+ * 而 [TOP_GAP] 又保住了上沿 ≈49dp ⇒ 按钮上方那条空档**又回来了**，
+ * 所以文字搬回 **28dp**，也就是它本来该在的地方。
+ *
+ * ## 落点怎么算的（340dpi 实测）
+ *
+ * ⚠️⚠️ **`labelLarge` 的墨迹是 30px 高，不是 20px**（实测：块顶 +9px 起算）。
+ * 我按 20px 算过一轮，结果闪字的下沿和按钮上沿**差 1px 贴在一起**——
+ * 数字得实测，不能按字号估。
+ *
+ * ⚠️⚠️ **这条带子的容量是定死的，改按钮位置必须回来重排这条线。**
+ * 它的高度 = `按钮上沿 − 时间胶囊墨迹底`。按钮越往上，带子越窄，闪字就越被挤。
+ *
+ * 340dpi 实测（三次排布）：
+ * ```
+ *                    时间胶囊底   闪字墨迹        按钮上沿   上留白  下留白
+ *   第五轮 TOP_GAP=7.4dp    36px   41–67px(24)     73px      5px     6px   ← 太挤
+ *   本轮 TOP_GAP=10dp       36px   45–69px(24)     79px     10px    10px   ← 定稿
+ * ```
+ * ⇒ **把闪字放在这条带子的正中**，两边留白相等；按钮往上挪就要同步把闪字往上挪，
+ * 否则下留白先被吃光（第五轮就是下留白只剩 6px，用户反馈「影响提示小字」）。
+ * ⚠️ 带子只剩 37px 的时候闪字**必须**用 `labelMedium`（墨迹 24px）；
+ * 换回 `labelLarge`（30px）两边就只剩 3px，看着是粘在时间胶囊上的。
+ * 本轮带子 44px，仍用 `labelMedium`（换成 labelLarge 也只剩 7px，没有实质收益）。
  *
  * **它是覆盖层，不进列表布局。** 进了的话每次滑动都会把整页内容顶下去一截，
- * 而第二页那点竖直空间是算到像素的（见 [ContactsPage] 里那段几何推导，
- * 角色卡片底角本来就已经贴着圆边相切）—— 再顶一下就会被圆边切掉。
+ * 而第二页那点竖直空间是算到像素的（见 [ContactsPage] 里那段几何推导）——
+ * 再顶一下就会被圆边切掉。
+ *
+ * ⚠️ 它同时受 [TOP_GAP] / [TOP_ACTION_WIDTH] 影响（两个都会挪按钮上沿）。
+ * **动按钮位置就必须回来重看这一条。**
  */
-private val MODE_FLASH_TOP = 28.dp
+private val MODE_FLASH_TOP = 17.5.dp
 
 /**
  * 角色卡片右列（右上角日期 / 右下角钟点）与左侧内容（名字 / 用量）之间的**间隙**。
@@ -297,7 +564,11 @@ private fun ModeFlashLabel(
     ) {
         Text(
             text = text,
-            style = MaterialTheme.typography.labelLarge,
+            // ⚠️ 这里原来是 `labelLarge`（墨迹实测 30px）。按钮按参考 app 上移到
+            // 73px 之后，时间胶囊墨迹底（36px）与按钮上沿之间只剩 37px ——
+            // 30px 的闪字塞进去两边各只剩 3px，看着是「粘」在时间胶囊上的。
+            // 降到 `labelMedium`（墨迹约 26px）才留得出呼吸。
+            style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
@@ -306,9 +577,15 @@ private fun ModeFlashLabel(
 /**
  * 第一页：ask。
  *
- * **除了外面套了一层分页外壳，这一页的内容与 1.0 逐字一致** ——
- * 几何常量、留白数值、空态文案、长按删除的确认框，一个都没动。
- * 唯一的差别是滚动指示器：竖的那条让位给底部的页面圆点，见 [HomeScreen] 的注释。
+ * 1.978 这一页的用户反馈来回调了三轮，全是版面：
+ *  1. 顶部留白 32dp → [TOP_GAP]、按钮 48dp → 44dp → **宽 90dp → 70dp**（见那几个常量）；
+ *  2. 按钮上角被圆屏切掉 ⇒ 按**上沿**那条弦重算，把按钮放回 [TOP_GAP] 卡得住的位置；
+ *  3. 按钮与内容之间太挤 ⇒ 恢复 [ACTIONS_GAP]（两页都给）；
+ *  4. 「最近对话」那四个字 ⇒ **第三轮整块删掉**，列表随之上移 32dp
+ *     （顺带把底部汇总行和翻页圆点的重叠解掉了）；
+ *  5. 列表末尾多一行「共 N tokens」的合计（只在这里，卡片本身不加用量）；
+ *  6. 卡片显示面积调小（见 [CONVERSATION_CARD_PADDING]）。
+ * 其余（空态文案、长按菜单、滚动指示器）没动。
  */
 @Composable
 private fun AskPage(
@@ -319,8 +596,14 @@ private fun AskPage(
     val conversations by ChatEngine.conversations.collectAsStateWithLifecycle()
     val notice by ChatEngine.notice.collectAsStateWithLifecycle()
     val settings by ChatEngine.settings.state.collectAsStateWithLifecycle()
+    // 哪一行正在重命名（AI 总结中）。在页面级订阅一次、当参数传进列表项 ——
+    // 列表项内部各订阅一次状态，滚动时会掉帧。
+    val renamingId by ChatEngine.renamingId.collectAsStateWithLifecycle()
 
     val listState = rememberScalingLazyListState()
+    /** 长按某一行之后停在它上面：先出两项菜单（重新命名 / 删除）。 */
+    var pendingRenameOrDelete by remember { mutableStateOf<Conversation?>(null) }
+    /** 菜单里选了「删除」之后，再确认一次才真删。 */
     var pendingDelete by remember { mutableStateOf<Conversation?>(null) }
 
     // 历史列表只认「说过话」的会话。首页那个＋只是拿一个 id 就跳进对话页，
@@ -345,14 +628,16 @@ private fun AskPage(
             // 关掉自动居中之后，item 默认按屏宽左对齐（圆屏上圆内左边距看着很歪），
             // 显式居中，两个胶囊才会稳稳落在圆心里。
             horizontalAlignment = Alignment.CenterHorizontally,
+            // 1.982：缩放加强（取值与理由见 [HOME_SCALING]）。
+            scalingParams = HOME_SCALING,
         ) {
             // 原来这里有个应用名标题，现在去掉了：
             // 圆屏最顶那一行本来就窄，留给两个主操作更值。
             //
-            // 这段留白是量出来的：时间胶囊底边在 y≈18dp，两个胶囊起点压到
-            // 约 32dp 处 —— 比初版的 42dp 再上移一圈，更接近参考 app「贴着
-            // 顶边、轻巧两个小按钮」的观感，又不至于和时间胶囊打架。
-            item(key = "top_gap") { GapItem(32.dp) }
+            // 1.978：这一项从 32dp 先压到 3dp、又调回 [TOP_GAP]（24dp）——
+            // 回撤的原因写在 [TOP_GAP] 上：压太狠按钮的上角会被圆屏切掉。
+            // 数字怎么来的见 [TOP_GAP] 的注释，别凭感觉改。
+            item(key = "top_gap") { GapItem(TOP_GAP) }
 
             item(key = "actions") {
                 TopActionButtons(
@@ -368,9 +653,11 @@ private fun AskPage(
                 }
             }
 
-            // 按钮行和下面的卡片之间补一点空隙。
-            // 之前两者紧挨着（只有 4.5dp），视觉上像被粘在一起。
-            item(key = "actions_gap") { GapItem(12.dp) }
+            // ⚠️ 这一项是**恢复到存在**的：1.978 第一版把它整个删掉想让内容上提，
+            // 结果用户的反馈是「两按钮和最近对话的间距太小了，看着很紧凑」。
+            // 它和 [TOP_GAP] 是**两处不同的空隙**：那个在按钮**上面**（避时间胶囊 + 圆边），
+            // 这个在按钮**下面**（避开第一块内容）。别再把两个合成一个。
+            item(key = "actions_gap") { GapItem(ACTIONS_GAP) }
 
             if (settings.apiKey.isBlank()) {
                 item(key = "need_key") {
@@ -402,17 +689,78 @@ private fun AskPage(
                     }
                 }
             } else {
-                item(key = "recent_header") {
-                    ListSubHeader { Text("最近对话") }
-                }
+                // ⚠️ 1.978 第三轮：**「最近对话」这个 `ListSubHeader` 整块删掉**
+                // （用户原话：「ask 页的『最近对话』四个字删去」）。
+                //
+                // 为什么删它不亏：这一行原本是「1.976 及以前列表被顶到屏幕中间」的元凶
+                // （它自带 `defaultMinSize(48.dp)`，见 [ListSubHeader] 那段踩坑记录），
+                // 为了把它压到目标位置，我们跟它的默认内边距斗了三轮
+                // （高度 + `contentPadding` 纵向必须同时给，两件事缺一不可）。
+                // 现在整块拿掉，那三个数（[TOP_GAP] 之外的 header 高度/内边距）一起消失，
+                // 列表整体上移 32dp，而且**上面那块空白由 [ACTIONS_GAP] 一处说了算**。
+                //
+                // 顺带解决了一个硬冲突：底部那行「共 N tokens」原来会被翻页圆点压住
+                // （圆点在 y457–468，汇总行墨迹 442–461 ⇒ 重叠 5px）。
+                // 列表上移之后汇总行落到 y≈370 一带，两者不再打架。
                 history.forEach { conversation ->
                     item(key = conversation.id) {
                         ConversationRow(
                             conversation = conversation,
+                            renaming = renamingId == conversation.id,
                             onClick = { onOpenConversation(conversation.id) },
-                            onLongClick = { pendingDelete = conversation },
+                            onLongClick = { pendingRenameOrDelete = conversation },
                         )
                     }
+                }
+            }
+
+            // 需求：Ask 首页底部安静地给一行**全部问答的 token 汇总**。
+            //
+            // ⚠️ 位置在 `bottom_gap` **之前**、列表**末尾**：它是整份列表的合计，
+            // 不是某一条的用量。
+            // ⚠️⚠️ **不要把它理解成「给每张卡片加用量」** —— 项目硬约定
+            // 「**ask 第一页列表永不加用量**」，每个 item 一行是违约。
+            // 这里只有列表末尾这一条汇总行，卡片本身一个字都不加。
+            //
+            // 空列表不显示（那时没有「全部问答」可言）。
+            //
+            // 老会话的 `totalTokens` 就是 0（字段是后加的），**不许写迁移补算** ——
+            // 显示成 0 是正确行为，见 `Models.kt` 的注释。
+            if (history.isNotEmpty()) {
+                item(key = "ask_total_tokens") {
+                    // ⚠️⚠️ 1.989：文案按用户要求改成
+                    // 「xx 个对话 · 共 xx tokens 消耗」（用户原话：
+                    // 「从『共24.8k tokens』到『xx个对话·共24.8k tokens消耗』（1.990 又去掉「最近」二字）。
+                    //  若一行太挤可换行显示」）。
+                    //
+                    // * 条数 = [history].size（「最近对话」列表正是这批会话）；
+                    // * **单行放不下就让它自然换行**（fillMaxWidth + 居中，不加
+                    //   maxLines/固定宽 —— 那会把换行变裁字，项目栽过的坑）；
+                    //   换行后整体仍居中，不影响翻页圆点（那个 12dp 的
+                    //   ASK_TOTAL_TOP_GAP 兜底仍在，见下）。
+                    // ⚠️⚠️ 1.990：文案「xx 个最近对话」→ **「xx 个对话」**（用户原话）。
+                    // 「最近」两个字多余——这一行本来就在「最近对话」列表末尾，
+                    // 写「最近」是重复。
+                    Text(
+                        text = "${history.size} 个对话 · " +
+                            "共 ${formatTokens(history.sumOf { it.totalTokens })} tokens 消耗",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        // ⚠️ 这行**必须离翻页圆点那条带子远一点**。
+                        // 翻页圆点（`HorizontalPagerScaffold` 的指示器）是**固定**画在
+                        // 屏幕底部正中的覆盖层，而这一行的位置随记录数线性下移：
+                        //   1 条 → 墨迹 366–388（圆点 456–468）✓
+                        //   2 条 → 墨迹 464–478 ⇒ **正好压在圆点上**，视觉上变成
+                        //          「共 30.9●k tokens」，两个东西叠在一起 ✗
+                        //   3 条以上 → 本来就在折叠线以下，滑到底才看得到 ✓
+                        // 顶上加 12dp：2 条时这一行被整体推到折叠线以下（变成「要滑一下才看到」，
+                        // 那是列表的正常行为），1 条时是 391–405，离圆点还有 51px ✓。
+                        // **别把这 12dp 删掉。**
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = ASK_TOTAL_TOP_GAP),
+                    )
                 }
             }
 
@@ -420,7 +768,35 @@ private fun AskPage(
         }
     }
 
-    // 圆屏上没地方放长按提示，所以长按只是「进入待删除」，真正删除要在这再确认一次
+    // 圆屏上没地方放长按提示，所以长按只是「进入待处理」，真正动手要在这再选一次
+    // （选「重新命名」或「删除」，然后各自再确认一次）——
+    // 绝不能让长按直接落到「删掉」，那是最容易误触的一步。
+    pendingRenameOrDelete?.let { target ->
+        WhaleChatMenuDialog(
+            title = target.displayTitle,
+            onDismiss = { pendingRenameOrDelete = null },
+            actions = buildList {
+                // 只有 ask 会话给「重新命名」：角色会话的标题恒等于角色名（建会话时就置位了），
+                // 叫模型去总结一遍会把角色名冲掉，而且纯属白烧钱。
+                // 判据与会话自己的 `personaId` 对齐，不另造一个。
+                if (target.personaId == null) {
+                    add(
+                        DialogAction("重新命名") {
+                            pendingRenameOrDelete = null
+                            ChatEngine.regenerateTitle(target.id)
+                        },
+                    )
+                }
+                add(
+                    DialogAction("删除", destructive = true) {
+                        pendingRenameOrDelete = null
+                        pendingDelete = target
+                    },
+                )
+            },
+        )
+    }
+
     pendingDelete?.let { target ->
         WhaleChatDialog(
             title = "删除这个对话？",
@@ -478,8 +854,11 @@ private fun ContactsPage(
             contentPadding = contentPadding,
             autoCentering = null,
             horizontalAlignment = Alignment.CenterHorizontally,
+            // 与第一页同一个缩放强度（理由见 [HOME_SCALING]：两页左右滑动，
+            // 强度不一致会「跳一下」）。
+            scalingParams = HOME_SCALING,
         ) {
-            item(key = "top_gap") { GapItem(32.dp) }
+            item(key = "top_gap") { GapItem(TOP_GAP) }
 
             item(key = "actions") {
                 TopActionButtons(
@@ -495,37 +874,36 @@ private fun ContactsPage(
                 }
             }
 
-            // 第二页这个间隙给 0dp（第一页是 12dp）。理由见下面那段长注释：这里省下的
-            // 每一 px 都是首屏那张角色卡片不被圆边吃掉底角所必需的。
-            item(key = "actions_gap") { GapItem(0.dp) }
+            // 与第一页同一个 [ACTIONS_GAP]（1.976 这里是 0dp，最挤的就是这一页）。
+            item(key = "actions_gap") { GapItem(ACTIONS_GAP) }
 
-            // ── 第二页为什么比第一页「挤」────────────────────────────────────
-            // 两页的结构本来是一模一样的，但第二页必须再抠出两处空间，否则**首屏那张
-            // 角色卡片会被圆边切开**。不是审美问题，是几何问题。数字都是 480x480
-            // 圆屏（半径 240px）上实测的：
+            // ── 第二页的竖直几何（1.978 重算过三轮）──────────────────────────
+            // 这一页没有 `ListSubHeader`，所以首屏那张角色卡片的位置由
+            // [TOP_GAP] + 按钮高度 + [ACTIONS_GAP] + 项间距决定。按 **2.125 px/dp**
+            // （模拟器 340dpi，用户那批参考图的实际密度）× 480px 圆屏（半径 240px）算：
             //
-            //   卡片：428px 宽 × 145px 高（居中、未缩放时）。
-            //   圆屏在 y 处的弦宽 = 2*sqrt(240^2 - (y-240)^2)。
-            //   y=417 时弦宽 324px，y=344 时 432px —— 卡片要整张落在圆里，它的
-            //   **最宽那条中线**（卡片顶边往下 72.5px 处）必须位于 y≈344 以上。
+            //   卡片：428px 宽 × ≈145px 高（居中、未缩放时），圆角半径 ≈55px。
+            //   圆屏在 y 处的弦宽 = 2*sqrt(240² − (y−240)²)。
+            //   卡片是**圆角矩形**，判定用它的**最宽那条中线**（顶边往下 72.5px）——
+            //   那是它左右两侧真正顶到 x=26/454 的地方；上下两条边因为圆角，
+            //   在端点处已经收进去了（1.976 的注释就是按这条判的，别再换成「上下边」）。
             //
-            // 按第一页的排法：ScreenScaffold 留白(82px) + top_gap(64px) + 两颗胶囊(102px)
-            // + actions_gap(24px) + ListSubHeader「角色」(111px) = 卡片顶边在 383px，
-            // 卡片中线落到 455px，那里弦宽只剩 385px < 428px → 底角被切、第二行字
-            // （相对时间/「还没聊过」）整个看不见。实测截图确认。
+            // 1.978 第二轮的落点（行宽已收窄到 144dp）：
+            //   contentPadding.top ≈23dp(49px) + 项间距 8.5 + top_gap 18dp(38px)
+            //   ⇒ 按钮顶 ≈96px、高 44dp(93.5px) ⇒ 按钮底 ≈190px
+            //   ⇒ 卡片顶 = 190 + 8.5 + actions_gap 10dp(21px) + 8.5 ≈ 228px
+            //   ⇒ 中线 = 228 + 72.5 = 300.5px
+            //   该处弦宽 = 2*sqrt(240² − 60.5²) ≈ 465px ≥ 428px ✓（余量 37px）
+            //   顺带核按钮自己：上沿 96px 处弦宽 ≈ 411px ≥ 行宽 306px ✓（**余量很大**）
+            //   （**第一版就是漏了「上沿」这一步才被切角的**，见 [TOP_GAP]）
             //
-            // 两处调整：
-            //   1. 去掉 ListSubHeader。一个纯标题实测占 111px —— 比两颗胶囊还高。
-            //      去掉后卡片顶边 272px，但底角仍被切 9~17px（截图确认，下缘两侧变斜口）。
-            //   2. actions_gap 12dp → 0dp，再还 24px。卡片顶边 248px，中线 320px，
-            //      该处弦宽 452px > 428px，底角只剩约 3px 的相切，肉眼看不出。
-            //      胶囊与卡片之间仍有约 21dp 空隙，不会显得粘在一起。
+            // ⚠️ 1.976 及以前这一页的首卡顶在 248px 附近，当时是靠「去掉 ListSubHeader +
+            // actions_gap 给 0dp」硬抠出来的。本轮不必再抠，但**结论要按上面重算**：
+            // 动 [TOP_GAP] / [ACTIONS_GAP] / [TOP_ACTION_WIDTH] 之后必须重新截图确认四角没被切。
             //
-            // top_gap 的 32dp 不能动：第一页那段注释说过它是量出来的，再往上两颗胶囊
-            // 自己的上角会顶到圆屏上沿。
-            //
-            // 顺带，去掉标题也更贴规格：顶部两颗胶囊 + 下面按顺序排列角色
-            // 卡片就够了，并没有要求加标题。（第一页的「最近对话」属于「一个字都不要动」。）
+            // ⚠️ 另外那条「第一页的『最近对话』属于『一个字都不要动』」的旧说法，
+            // **在 1.978 第三轮彻底作废**：那个标题最后是被**删掉**的（不是「一个字都不要动」，
+            // 也不是「挪到某个 y」）。见上面 AskPage 里那段注释。
             if (personas.isEmpty()) {
                 item(key = "empty") {
                     Card(
@@ -696,27 +1074,68 @@ private fun ConversationRow(
     conversation: Conversation,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    /** 这一行正在被重新命名（AI 总结中）。true 时副标题位置换成变形进度条。 */
+    renaming: Boolean = false,
 ) {
     TitleCard(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        // 1.978 第三轮：卡片显示面积调小（统一值 + 理由见 [CARD_CONTENT_PADDING]）。
+        // ⚠️ `height` 不能省：只给 contentPadding 的话 `defaultMinSize(64.dp)` 会把卡片撑回去。
+        modifier = Modifier.fillMaxWidth().height(CARD_HEIGHT),
+        contentPadding = CARD_CONTENT_PADDING,
         title = {
             Text(
                 text = conversation.displayTitle,
-                style = MaterialTheme.typography.titleMedium,
+                // 1.978 第五轮：用户要求「卡片的标题字样稍微做小一点」。
+                // `titleMedium`(16sp) → `titleSmall`(14sp)，**只动会话卡片**（就是用户
+                // 指着的那批）；角色卡片的名字维持 `titleMedium` —— 那是「谁在说话」，
+                // 层级要比一句提问高。副标题照旧 `labelSmall`(11sp)，标题/副标题仍有 3sp 落差。
+                style = MaterialTheme.typography.titleSmall,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                // ⚠️⚠️ 1.986：**挂 `align(CenterVertically)`**（「标题过于靠上」的修法）。
+                //
+                // 1.985 曾把卡高压到 50dp 想消灭「Column 底部剩余空间」，
+                // 用户实测「卡片怎么改的好小」⇒ 1.986 回到 56dp，偏上问题换杠杆解决：
+                //
+                // `TitleCard` 的 title 行是 `verticalAlignment = Alignment.Top`
+                // （库源码 `Card.kt:1096`）⇒ 标题贴着行顶。挂 RowScope 的
+                // `align(CenterVertically)` 后，**title 行盒在自己的可用高里垂直居中**
+                // —— 剩余空间不再全落在底部，观感回正。
+                //
+                // ⚠️ 通讯录那张卡（`PersonaRow`）的 title 槽**从一开始就挂着这个 align**，
+                // 两页行为不一致也是「偶发」错觉的来源之一（只在 ask 首页这批卡上明显）。
+                modifier = Modifier.align(Alignment.CenterVertically),
             )
         },
         subtitle = {
-            Text(
-                text = relativeTime(conversation.sortKey),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            if (renaming) {
+                // 重命名要发一次 `complete()` 调用，来回可能好几秒。
+                // 没有反馈的话用户点完菜单那一下就什么都看不到，只能猜是不是坏了。
+                // 进度条用和「捏人中 / 正在思考」同一个 M3E 变形环，三处等待语言一致。
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    WavyProgressIndicator(diameter = 24.dp, compact = true)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = "正在总结…",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                Text(
+                    text = relativeTime(conversation.sortKey),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    // ⚠️ 1.985：subtitle 槽是 **ColumnScope**，`align` 只收
+                    // `Alignment.Horizontal` ⇒ **没有垂直居中可用**（挂了编译不过）。
+                )
+            }
         },
         onLongClick = onLongClick,
-        onLongClickLabel = "删除对话",
+        // 1.978 起长按出的是**两项菜单**（重新命名 / 删除），不再是「直接进待删除」，
+        // 所以无障碍描述也跟着改 —— 还写「删除对话」会让读屏用户以为长按就会删。
+        onLongClickLabel = "更多操作",
     )
 }
 
@@ -783,7 +1202,9 @@ private fun PersonaRow(
     val chatted = persona.lastChatAt > 0L
     TitleCard(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        // 与会话卡片共用同一组值：两页卡片大小不一致的话，滑动时会看出「一张鼓出来」。
+        modifier = Modifier.fillMaxWidth().height(CARD_HEIGHT),
+        contentPadding = CARD_CONTENT_PADDING,
         title = {
             Text(
                 text = persona.name,

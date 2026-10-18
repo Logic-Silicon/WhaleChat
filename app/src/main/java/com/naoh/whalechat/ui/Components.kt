@@ -1,38 +1,63 @@
 package com.naoh.whalechat.ui
 
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberOverscrollEffect
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.wear.compose.foundation.lazy.ScalingLazyListState
 import androidx.wear.compose.material3.AlertDialog
+import androidx.wear.compose.material3.AlertDialogDefaults
 import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.ButtonDefaults
 import androidx.wear.compose.material3.Card
 import androidx.wear.compose.material3.CardDefaults
+import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.MaterialTheme
+import androidx.wear.compose.material3.ScreenScaffoldDefaults
 import androidx.wear.compose.material3.Text
-import androidx.wear.compose.material3.TextButton
 import androidx.wear.compose.material3.TextToggleButtonDefaults
 import androidx.wear.compose.material3.TextToggleButtonShapes
+import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
 
 /**
  * 列表里的纯留白项。
@@ -83,7 +108,40 @@ fun NoticeCard(text: String, onDismiss: () -> Unit, modifier: Modifier = Modifie
     }
 }
 
-/** 带头行图标的小卡片，首页和设置页共用。 */
+/**
+ * 带头行图标的小卡片，首页和设置页共用。
+ *
+ * ## 1.982：多了一个 [contentPadding] 形参
+ *
+ * 起因是设置页那两张「一行文字却有两行高度」的卡（见
+ * `SettingsScreen.SINGLE_LINE_CARD_HEIGHT`）：要压掉 `Card` 自带的
+ * `defaultMinSize(64.dp)`，**唯一有效杠杆是显式 `Modifier.height(h)`**
+ * （从 [modifier] 传进来），而**给了高度就必须把纵向内边距一起压到 0** ——
+ * 否则内边距把内容吃光、`Text` 量成 0 高、**整张卡画不出来**。
+ *
+ * 所以这里把 `contentPadding` 开放出来，**默认值仍是库的
+ * `CardDefaults.ContentPadding`（横 12dp / 纵 12dp）** ——
+ * 其余十几个调用点一个字都不用改，行为与 1.981 完全一致。
+ *
+ * ## ⚠️⚠️ 1.982 补：压掉纵向内边距会让文字**贴到卡片上沿**（实测踩到）
+ *
+ * 这是我第一版漏掉的一件事：**「卡片矮了」和「文字在卡片里居中」是两件事**。
+ *
+ * * `Card` 内部的容器是个 `Column`，用的是**默认的 `Arrangement.Top`**；
+ * * 纵向 `contentPadding` 压到 0 之后，**唯一把文字往下推的东西就没了**；
+ * * 而 `Modifier.height(h)` 又把那个 `Column` 钉成正好 h ⇒
+ *   多出来的空间**全落在文字下面**。
+ *
+ * 340dpi 实测（`h = 48dp`、卡片 102px、文字 49px）：
+ * **上空隙 0px / 下空隙 53px** —— 文字贴在顶上，肉眼一眼能看出偏。
+ *
+ * 修法是给内容行挂 [Modifier.fillMaxHeight] + `verticalAlignment = CenterVertically`：
+ * `fillMaxHeight` 只在**高度有界**时生效（`Size.kt` 的 `FillNode.measure`：
+ * `if (constraints.hasBoundedHeight && …)`），所以
+ *  * **钉了高度的卡**（设置页这两张）⇒ 行撑满 h，里面那行文字/图标**垂直居中**；
+ *  * **没钉高度的卡**（其余十几个调用点，进 lazy 列表时 maxHeight 是 `Infinity`）
+ *    ⇒ `fillMaxHeight` 是**空操作**，行为与 1.981 逐字一致。
+ */
 @Composable
 fun ActionCard(
     title: String,
@@ -91,38 +149,110 @@ fun ActionCard(
     icon: androidx.compose.ui.graphics.vector.ImageVector? = null,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = CardDefaults.ContentPadding,
 ) {
     Card(
         onClick = onClick,
         modifier = modifier.fillMaxWidth(),
+        contentPadding = contentPadding,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainer,
             contentColor = MaterialTheme.colorScheme.onSurface,
         ),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            if (icon != null) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    modifier = Modifier
-                        .size(20.dp)
-                        .padding(end = 6.dp),
-                )
-            }
-            Column {
-                Text(text = title, style = MaterialTheme.typography.titleMedium)
-                if (!subtitle.isNullOrBlank()) {
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        // ⚠️⚠️ 1.982 补：外面套一个**撑满**的 `Box`，只做**垂直**居中。
+        //
+        // 为什么需要它（实测踩到）：`Card` 内部容器是个 `Column`、
+        // 用的是默认的 `Arrangement.Top`；纵向 `contentPadding` 压到 0 之后，
+        // **唯一把内容往下推的东西就没了**，而 `Modifier.height(h)` 又把那个 `Column`
+        // 钉成正好 h ⇒ 多出来的空间**全落在内容下面**。
+        // 340dpi 实测（h=48dp / 卡片 102px / 文字 49px）：**上空隙 0px、下空隙 53px**。
+        //
+        // ⚠️⚠️ **必须是 `Alignment.CenterStart`，不能写 `Alignment.Center`。**
+        // `Alignment.Center` 是**两个方向都居中**，会对横向也生效 ——
+        // 而 `ActionCard` 的观感一直是「图标 + 文字**靠左**」，
+        // 横向居中是**这一版不允许引入的回归**（它会影响全部 20 个调用点）。
+        // `CenterStart` = 垂直居中 + 水平起点对齐 ⇒ 横向行为与 1.981 **逐字相同**。
+        //
+        // ⚠️ 对**没钉高度**的调用点（其余 20 处，进 lazy 列表时 maxHeight 无界）
+        // 这里整段是**空操作**：`fillMaxSize` 的 `FillNode` 在 `hasBoundedHeight == false`
+        // 时原样透传约束 ⇒ Box 高度 = 内容自然高 ⇒ 垂直居中无处可移。
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (icon != null) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .padding(end = 6.dp),
                     )
+                }
+                Column {
+                    Text(text = title, style = MaterialTheme.typography.titleMedium)
+                    if (!subtitle.isNullOrBlank()) {
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
     }
 }
+
+/**
+ * 贴边按钮与列表内容之间留多少空。
+ *
+ * 库默认是 `ScreenScaffoldDefaults.EdgeButtonSpacing`（16dp）。1.981 压到**库允许的最小值**
+ * （`EdgeButtonMinSpacing`，3dp）—— 用户要的是「中间那片留白小一点」。
+ *
+ * ⚠️ 这是 `ScreenScaffold` 的**公开参数**，不是我硬塞的 padding。它同时决定
+ * 「列表底部内边距」和「按钮满高」两个量（库里两处读的是同一个值，见
+ * `ScreenScaffold.kt` 的 `effectiveEdgeButtonSpacing`），所以一处取值两边一致、不会失配。
+ *
+ * ⚠️ 附带一条实测结论（用来核对有没有改坏）：`edgeButtonSpacing` **不会**改变按钮
+ * 满高那一刻的高度 ——
+ * ```
+ * 列表底部内边距 = intrinsicButtonHeight + (spacing − minSpacing)
+ * 按钮满高       = 列表底部内边距   − (spacing − minSpacing) = intrinsicButtonHeight
+ * ```
+ * 两处 `(spacing − minSpacing)` 正好抵消。所以调它只动「内容 ↔ 按钮」那条缝。
+ */
+val BackEdgeButtonSpacing: Dp = ScreenScaffoldDefaults.EdgeButtonMinSpacing
+
+/**
+ * 贴边按钮必须挂的 `Modifier.scrollable(...)`。
+ *
+ * **官方 Wear Lists 指南「列表中的边缘按钮」一节的示例里就带这一句**，原文注释：
+ * > Apply overscroll to the EdgeButton for proper scrolling behavior.
+ *
+ * 它把按钮接进列表**同一条滚动链路**（`reverseDirection = true`）：
+ * 手指落在按钮上往上拖，列表照样跟着滚，按钮也随之浮起/沉下。
+ *
+ * ⚠️ **五处贴边按钮（聊天页 / 扫码页 / 语音识别 / 显示设置 / 关于）一个都不能漏。**
+ * 漏掉的后果不是「少个手势」：按钮会把落在它身上的触摸整个吃掉，按钮的滚动状态
+ * 和列表对不上，而 `ScreenScaffold` 的高度恰恰由 `isScrollInProgress` 决定走
+ * `snapTo` 还是 `animateTo` 分支（见 `ScreenScaffold.kt`），
+ * 于是高度会在两个分支之间来回切 —— 1.980 报上来的那次「像果冻一样自己一直上下起伏」，
+ * 复现数据见 `_1980_work/jiggle*.py` 与 `WHALECHAT_1.981_修复报告.md`。
+ *
+ * ⚠️ `overscrollEffect` 必须是**现取一个** `rememberOverscrollEffect()`：
+ * 官方示例就是这么写的，注释里点名了「否则滚动行为不对」。
+ */
+@Composable
+fun Modifier.edgeButtonScrollable(state: ScalingLazyListState): Modifier =
+    this.scrollable(
+        state = state,
+        orientation = Orientation.Vertical,
+        reverseDirection = true,
+        overscrollEffect = rememberOverscrollEffect(),
+    )
 
 /**
  * 同一天内的钟点。**应用里只此一份 24 小时制定义** —— chat 卡片的时间也复用它，
@@ -279,9 +409,30 @@ private fun startOfDay(millis: Long): Long = Calendar.getInstance().apply {
 fun selectionToggleShapes(): TextToggleButtonShapes =
     TextToggleButtonDefaults.variantAnimatedShapes()
 
-/** 一行说明文字。设置页各子页共用，故意做成不适合点击的样子。 */
+/**
+ * 一行说明文字。设置页各子页共用，故意做成不适合点击的样子。
+ *
+ * ## ⚠️ 1.986：加了 [inCard] 形参（用户原话：「语音识别最底下文字描述卡片
+ * 直接改成只剩文字，**不用放在那个大空卡片里** 很丑」）
+ *
+ * 默认 `true`（保持原来的静态卡片形态）——**其余调用点一个字都不用改**。
+ * 语音识别页那处传 `false`，渲染成**纯文字**（居中、`onSurfaceVariant`，
+ * 与卡片版同一套排版 token），不再套那张大空卡。
+ */
 @Composable
-fun HintText(text: String) {
+fun HintText(text: String, inCard: Boolean = true) {
+    if (!inCard) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp),
+            textAlign = TextAlign.Center,
+        )
+        return
+    }
     // 静态卡片：Wear M3 的 Card 没有非点击重载，静态版本 = onClick = {} + enabled = false，
     // 只写 onClick = {} 会带上水波纹，看着像能点。
     Card(
@@ -301,6 +452,210 @@ fun HintText(text: String) {
         )
     }
 }
+
+/**
+ * M3E 的**波浪形圆形进度指示器**（indeterminate / 不定进度）。
+ *
+ * ## 这是「移植」，不是「照着照片仿制」
+ *
+ * 上一版是我按用户给的一张截图反解形状自己写的（余弦波瓣环），
+ * 用户的评价是「丑、不还原」，并给了两处参考：
+ * `m3.material.io/components/progress-indicators/specs` 和
+ * `github.com/JAICHANGPARK/material3_indicators`。
+ * ⇒ 本版**逐行移植**那个仓库的 `WavyCircularProgressIndicator`，不再自创形状。
+ *
+ * 移植来源：`lib/src/wavy_circular_progress_indicator.dart`（MIT）。
+ * **公式、默认值、动效时序逐条照搬，一处没改**：
+ *
+ * | 项 | 参考实现 | 这里 |
+ * |---|---|---|
+ * | 底轨半径 | `size/2 − (amplitude + max(strokeWidth, trackStrokeWidth)/2)` | 同 |
+ * | 波浪半径 | `r(θ) = baseRadius + amplitude·scale·sin(frequency·θ − phase)` | 同 |
+ * | 相位 | `phase = animationValue · waveSpeed · 2π` | 同 |
+ * | 边缘包络 | `fadeZone = min(π/4, totalArc/3)`，两端 `scale` 从 0 线性升到 1 | 同 |
+ * | 频率 | `frequency = 8.0`（一圈 8 个波峰） | 同 |
+ * | 其它默认 | `strokeWidth 4 / trackStrokeWidth 2 / amplitude 3 / waveSpeed 4`（对 48 逻辑像素而言） | 同（按直径等比换算） |
+ * | 动效周期 | `AnimationController(duration: 2s)..repeat()` | 2.0s |
+ * | 不定进度的头尾 | `head = easeInOut(clamp(v·2))`、`tail = easeInOut(clamp((v−0.5)·2))`，再加 `spin = v·2π` | 同 |
+ * | 缓动 | `Curves.easeInOut` = cubic-bezier(0.42, 0, 0.58, 1) | `CubicBezierEasing(0.42f, 0f, 0.58f, 1f)` |
+ *
+ * ⚠️ 一个数字**不是**照搬的：那个库是 Flutter，尺寸单位是逻辑像素；
+ * 这里用**直径的比例**（`4/48`、`2/48`、`3/48`）换算，所以任何 `diameter` 下比例都不变。
+ *
+ * ## 为什么是「自己画」（唯一一处破例，理由写完再动）
+ *
+ * 项目铁律是「组件只用 `androidx.wear.compose.material3.*`，别自己画」。**这一处必须破例**：
+ *  * 这个效果在 **Wear M3 1.5.6 里根本不存在** —— 解包 `classes.jar` + `sources.jar`
+ *    逐个核对过，那一版跟进度沾边的只有 `CircularProgressIndicator`（含 indeterminate /
+ *    溢出变体）、`LinearProgressIndicator`、`ArcProgressIndicator`、
+ *    `SegmentedCircularProgressIndicator`，**一个都没有波浪**；
+ *  * 官方实现（`androidx.compose.material3` 1.4+ 的 `MaterialShapes` / wavy 系列）要
+ *    **升依赖**，而本项目不许升。
+ *
+ * ⇒ 只能按参考实现复刻。**这一段是本版唯一的「非官方组件」**，改它之前先读上面那张对照表。
+ *
+ * ## ⚠️ 驱动方式：不用 `rememberInfiniteTransition`（实测踩出来的）
+ *
+ * 第一版用 `rememberInfiniteTransition().animateFloat(...)`（教科书写法），
+ * 在模拟器上**实测是静止的**：截图逐帧差分 0 像素、`screenrecord` 抽帧只有压缩噪声、
+ * `dumpsys gfxinfo` 的 `Total frames rendered` 3 秒里 1470 → 1470（一个帧都没出）。
+ *
+ * 原因：`InfiniteTransition` 走 `withInfiniteAnimationFrameNanos`，推进靠 **vsync 帧回调**，
+ * 而这台模拟器闲置时不给帧；Wear 还会用 `InfiniteAnimationPolicy` 插手无限动画。
+ * ⇒ **别把「转不转」押在帧回调上**。这里用 `LaunchedEffect` + `delay(16ms)` 自推时间
+ * （16ms 对应参考实现跑在 60fps 上的观感）：`delay` 走主线程 Handler，
+ * 每写一次时间就 invalidate 一次，**它自己把帧要出来**。
+ *
+ * ## 形态说明（别看错）
+ *
+ * 参考实现的不定进度是「**平的细底轨 + 一条粗的波浪活弧**」，
+ * 活弧在一个 2s 周期里从无长到整圈、再缩回无，同时整体还转一圈。
+ * 用户给的截图里那一圈「整圈波浪」是同一个组件的 **确定进度 value=1 那一帧**
+ * （整圈都是活弧、只有一个 45° 的包络收口）—— 我们这里是不定进度，
+ * 所以那一帧只在每个周期的中段出现一下，这是对的，不是没还原。
+ *
+ * @param diameter 外径。所有粗细/振幅都按它的比例推（见 [WAVY_*] 常量），
+ *   所以任何尺寸下相对比例都与参考实现一致。
+ * @param compact 小尺寸（列表行里那颗 24dp）用。等比例的振幅在这个尺寸下不足 2px，
+ *   会看不出波浪，所以小尺寸**刻意把振幅和线宽的比例放大**（这是唯一一处偏离参考比例的地方）。
+ */
+@Composable
+fun WavyProgressIndicator(
+    modifier: Modifier = Modifier,
+    diameter: Dp = 48.dp,
+    compact: Boolean = false,
+) {
+    // 自推时间（原因见上面那段 ⚠️）。用 `mutableFloatStateOf` 而不是 `mutableStateOf`：
+    // 每 16ms 写一次，装箱/拆箱在长时间运行下是白花的。
+    var elapsed by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(WAVY_TICK_MS)
+            elapsed += WAVY_TICK_MS / 1000f
+        }
+    }
+
+    val activeColor = MaterialTheme.colorScheme.primary
+    // 参考实现底轨用的是 `surfaceContainerHighest`（手机版 M3 的 token），
+    // Wear M3 的 ColorScheme 里**没有**这个名字 —— 用语义最接近的 `surfaceContainerHigh`。
+    val trackColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val strokeRatio = if (compact) WAVY_STROKE_RATIO_COMPACT else WAVY_STROKE_RATIO
+    val trackRatio = if (compact) WAVY_TRACK_RATIO_COMPACT else WAVY_TRACK_RATIO
+    val ampRatio = if (compact) WAVY_AMPLITUDE_RATIO_COMPACT else WAVY_AMPLITUDE_RATIO
+
+    Canvas(modifier = modifier.size(diameter)) {
+        // 参考实现：`animationValue` 就是一个 0→1 的循环（AnimationController..repeat()）。
+        val av = (elapsed % WAVY_CYCLE_SECONDS) / WAVY_CYCLE_SECONDS
+
+        val box = size.minDimension
+        val stroke = box * strokeRatio
+        val trackStroke = box * trackRatio
+        val amplitude = box * ampRatio
+        // 参考实现：底轨半径要把振幅与线宽让出来，否则波峰会被画到框外。
+        val baseRadius = box / 2f - (amplitude + max(stroke, trackStroke) / 2f)
+        if (baseRadius <= 0f) return@Canvas
+
+        // 1) 平的底轨（参考实现也是先画一个正圆底轨）。
+        drawCircle(
+            color = trackColor,
+            radius = baseRadius,
+            center = center,
+            style = Stroke(width = trackStroke),
+        )
+
+        // 2) 波浪活弧：不定进度 = 头尾各扫一次 + 整体自转。
+        val phase = av * WAVY_WAVE_SPEED * TWO_PI
+        val spin = av * TWO_PI
+        val head = WAVY_EASE_IN_OUT.transform((av * 2f).coerceIn(0f, 1f))
+        val tail = WAVY_EASE_IN_OUT.transform(((av - 0.5f) * 2f).coerceIn(0f, 1f))
+        val start = -PI_F / 2f + tail * TWO_PI + spin
+        val end = -PI_F / 2f + head * TWO_PI + spin
+        if (end <= start) return@Canvas
+
+        drawPath(
+            path = buildWavyArcPath(center, baseRadius, amplitude, start, end, phase),
+            color = activeColor,
+            style = Stroke(width = stroke, cap = StrokeCap.Round, join = StrokeJoin.Round),
+        )
+    }
+}
+
+/**
+ * 参考实现里的 `_buildWavyArcPath` + `_calculateRadius`，逐行对应。
+ *
+ * 两个关键点：
+ *  1. 采样步长固定 **2°**（`π/90`），跟着弧长走 —— 弧越长点越多，短弧不会被画成折线；
+ *  2. **边缘包络线**：`fadeZone = min(π/4, 总弧长/3)`，两端 `scale` 从 0 线性升到 1，
+ *     让波浪在弧的头尾**收到 0 振幅**，于是接头处平滑并进底轨、不会突然「折断」。
+ *     这就是那个库 README 里说的「边缘包络线（Edge Envelope）」。
+ */
+private fun buildWavyArcPath(
+    center: Offset,
+    baseRadius: Float,
+    amplitude: Float,
+    startAngle: Float,
+    endAngle: Float,
+    phase: Float,
+): Path {
+    val path = Path()
+    val totalArc = endAngle - startAngle
+    if (totalArc <= 0f) return path
+
+    val fadeZone = min(PI_F / 4f, totalArc / 3f)
+    val steps = max(8, (totalArc / (PI_F / 90f)).toInt())
+
+    for (i in 0..steps) {
+        val theta = startAngle + totalArc * i / steps
+        val scale = when {
+            theta - startAngle < fadeZone -> (theta - startAngle) / fadeZone
+            endAngle - theta < fadeZone -> (endAngle - theta) / fadeZone
+            else -> 1f
+        }
+        val r = baseRadius + amplitude * scale * sin(WAVY_FREQUENCY * theta - phase)
+        val x = center.x + r * cos(theta)
+        val y = center.y + r * sin(theta)
+        if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+    }
+    return path
+}
+
+/**
+ * 一圈里的波峰数。**参考实现的默认值就是 8**，而且用户那张截图反解出来也正好是 8 个波瓣
+ * （FFT 的 8 次分量幅值 1621，7/9 次只有 60 上下）—— 两边独立对上了，别再改这个数。
+ */
+private const val WAVY_FREQUENCY = 8f
+
+/** 波浪沿圆周传播的速度（弧度倍数）。参考实现默认 4.0。 */
+private const val WAVY_WAVE_SPEED = 4f
+
+/** 一个完整循环的时长，秒。参考实现是 `AnimationController(duration: 2s)..repeat()`。 */
+private const val WAVY_CYCLE_SECONDS = 2.0f
+
+/** 自推时间的步长，毫秒。16ms ≈ 60fps，对应参考实现跑在 Flutter 上的观感。 */
+private const val WAVY_TICK_MS = 16L
+
+/**
+ * 粗细则按**直径的比例**给（参考实现的 4/2/3 是「对 48 逻辑像素」而言的）：
+ * `strokeWidth 4/48`、`trackStrokeWidth 2/48`、`amplitude 3/48`。
+ */
+private const val WAVY_STROKE_RATIO = 4f / 48f
+private const val WAVY_TRACK_RATIO = 2f / 48f
+private const val WAVY_AMPLITUDE_RATIO = 3f / 48f
+
+/**
+ * 小尺寸档（24dp）：**唯一一处刻意偏离参考比例的地方**。
+ * 等比例下振幅只有 24×3/48 = 1.5dp（≈3px），在这个尺寸上根本看不出波浪；
+ * 这里把振幅提到 9%、线宽提到 11%，小环上才还看得出「在波动」。
+ */
+private const val WAVY_STROKE_RATIO_COMPACT = 0.11f
+private const val WAVY_TRACK_RATIO_COMPACT = 0.055f
+private const val WAVY_AMPLITUDE_RATIO_COMPACT = 0.09f
+
+/** 参考实现的 `Curves.easeInOut`，数值就是 cubic-bezier(0.42, 0, 0.58, 1)。 */
+private val WAVY_EASE_IN_OUT = CubicBezierEasing(0.42f, 0f, 0.58f, 1f)
+
+private const val PI_F = Math.PI.toFloat()
+private const val TWO_PI = 2f * PI_F
 
 /**
  * 菜单弹窗里的一项。
@@ -470,15 +825,32 @@ private fun trimZero(value: Double): String {
 /**
  * 应用里所有「要不要」的确认框都走这一个。
  *
- * **为什么不用 `ConfirmationDialog`**：那个控件是给「操作成功了 / 失败了」这类一次性
- * 反馈设计的 —— 它把确认动作渲染成一个旋转 45° 的**圆形图标按钮**，再压在一块圆角
- * 方形容器上。在圆屏上就是一个红圆叠一个方片，跟应用里其余卡片的形状语言完全脱节
- * （用户的评价是「好丑」），而且它只有图标、没有文字余地，「删除」这种要说清楚后果的
- * 场景根本放不下。
+ * ## 为什么不用 `ConfirmationDialog`
  *
- * `AlertDialog` 才是对的控件：它是 ScreenScaffold + 全屏可滚动的 ScalingLazyColumn，
- * 标题、正文、两个胶囊按钮的形状与配色都跟应用其它页面同源，也顺带解决了圆屏
- * 顶部时间胶囊的避让。默认色板跟着莫奈取色走，所以它就是 Material You。
+ * 那个控件是给「操作成功了 / 失败了」这类一次性反馈设计的 —— 它把确认动作渲染成一个
+ * 旋转 45° 的**圆形图标按钮**，再压在一块圆角方形容器上。在圆屏上就是一个红圆叠一个
+ * 方片，跟应用里其余卡片的形状语言完全脱节（用户的评价是「好丑」），而且它只有图标、
+ * 没有文字余地，「删除」这种要说清楚后果的场景根本放不下。
+ *
+ * ## 1.978：改成 M3E 的**底部边按钮**布局（用户对旧版的原话：「太丑了」）
+ *
+ * 旧版用的是 `AlertDialog` 的「confirmButton + dismissButton」两个槽：确认是右下角一颗
+ * 小胶囊、取消是左下角的**纯文字**。两颗按钮都缩在底部一角，既不像按钮，也没能表达
+ * 「这一步是这一页最重要的动作」。
+ *
+ * 现在换成 Wear M3 1.5.6 的 **`edgeButton` 重载** —— 这是这一版给对话框准备的
+ * M3 Expressive 形态：
+ *
+ *  * 主要动作是 `AlertDialogDefaults.EdgeButton`：**整条占满屏宽、贴住对话框底部**，
+ *    形状跟着圆屏下沿走。危险动作用 `errorContainer` 上色（见 [destructive]）。
+ *  * 次要动作（取消）放进 `content` 槽，做成一颗**整宽**的 `FilledTonalButton`。
+ *    这也是官方 `AlertDialogWithContentGroupsSample` 的写法 ——
+ *    对话框里那列东西本来就该是整宽的按钮，不是缩在角上的一行字。
+ *  * 退出仍然是三条路都通：点那颗取消、点对话框外面（scrim）、按返回键
+ *    （`AlertDialog` 内部把 Back 也接到 `onDismissRequest`）。
+ *
+ * ⚠️ **不要退回「自绘两颗粒子按钮」那版**：那不是 M3 的对话框形态，
+ * 也是这次被点名要改掉的东西。
  *
  * @param quote 需要给用户看原文的场合（比如「你要改的是这一句」），作为强调行排在
  *   解释文字上方。传 null 就没有这一行。
@@ -508,9 +880,9 @@ fun WhaleChatDialog(
         },
         // 原文和解释挤在同一个 text 槽里，而不是给原文单独套一张卡片。
         //
-        // 这是量出来的：这块屏只有 226dp 见方，卡片自带的内容内边距（上下各 16dp）
-        // 光为了一行字就要吃掉 90px，整段内容因此溢出到圆屏下沿，确认按钮被圆边切掉。
-        // 合成一段之后，原文靠字号和颜色跟解释拉开层次，省下的全是按钮的空间。
+        // 这是量出来的：卡片自带的内容内边距（上下各 16dp）光为了一行字就要吃掉 90px，
+        // 整段内容因此溢出到圆屏下沿。合成一段之后，原文靠字号和颜色跟解释拉开层次，
+        // 省下的全是底部那颗边按钮的空间。
         text = {
             Column(
                 modifier = Modifier.fillMaxWidth(),
@@ -537,24 +909,9 @@ fun WhaleChatDialog(
                 )
             }
         },
-        confirmButton = {
-            Button(
+        edgeButton = {
+            AlertDialogDefaults.EdgeButton(
                 onClick = onConfirm,
-                // 形状必须显式钉成胶囊。
-                //
-                // Wear M3 的 ButtonDefaults.shape 是 RoundedCornerShape(26.dp) —— 一个
-                // **绝对**半径。这些按钮只有 48dp 高，26dp 的圆角已经超过半高，Compose
-                // 不会把半径夹到一半，而是照画四段圆弧，结果四角互相盖住、渲染成一个
-                // 歪鸭蛋（实测截图确认）。percent = 50 是相对半径，永远等于半高，
-                // 于是无论按钮多大都是一个规规矩矩的胶囊 —— 和首页、输入页那几个按钮同款。
-                //
-                // 光有形状还不够：48dp 高的小按钮如果宽度也只有 56dp，胶囊本身就是一个
-                // 圆。「编辑」两个字撑不出宽度（Wear 的 Button 左右内边距只有 14dp），
-                // 所以再给一个最小宽度把它拉成横着的胶囊 —— 输入页那个「发送」就是
-                // 这个比例。widthIn 而不是 width：设置页那个「全部清空」四个字更长，
-                // 钉死宽度会把它挤没。
-                shape = RoundedCornerShape(percent = 50),
-                modifier = Modifier.widthIn(min = 76.dp),
                 colors = if (destructive) {
                     ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.errorContainer,
@@ -564,37 +921,27 @@ fun WhaleChatDialog(
                     ButtonDefaults.buttonColors()
                 },
             ) {
-                // 这一行必须显式让文字自己居中，不能指望 Button 帮我们居中。
-                //
-                // Wear M3 的 `Button`（内部 `ButtonImpl`）是一个
-                // `Row(modifier, verticalAlignment = CenterVertically)` ——
-                // **没有 horizontalArrangement**，也就是默认的 `Arrangement.Start`。
-                // 手机版 Material 3 在同一位置写的是 `Arrangement.Center`，Wear 版没有；
-                // 因为官方假定按钮宽度总是"抱住内容"
-                // （`Modifier.width(intrinsicSize = IntrinsicSize.Max)`），
-                // 宽度 == 内容宽度时 Start 和 Center 看不出区别 —— 这个假定一破就露馅。
-                //
-                // 文字虽然带着 `TextAlign.Center`，但它在 Row 里是 wrap 宽度，
-                // 那个 center 没有可居中的余量，等于没生效。
-                //
-                // 平时按钮宽度就是"抱住文字"，看不出问题；一旦上面那个
-                // `widthIn(min = 76.dp)` 把按钮从「圆」拉成「胶囊」，
-                // 多出来的宽度就**全部堆在右边**。实测「编辑」两字：
-                // 左边距 16.5dp、右边距 35.0dp，肉眼就是"字没居中"。
-                //
-                // 让 Text 自己占满整行，`TextAlign.Center` 才有余量可用。
-                Text(
-                    text = confirmLabel,
-                    maxLines = 1,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                // EdgeButton 内部那个 Row 已经是 `Arrangement.Center` + `TextAlign.Center`，
+                // 所以这里**不要再加 `fillMaxWidth()`** —— 它会把内容顶成整行宽，
+                // 反而让 `TextAlign.Center` 失去可居中的余量（旧版那颗胶囊踩过这个坑）。
+                Text(text = confirmLabel)
             }
         },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(text = "取消", maxLines = 1)
-            }
-        },
-    )
+    ) {
+        item {
+            // 取消是**次要动作**：整宽的 tonal 按钮。见类注释里为什么不用 `TextButton`。
+            FilledTonalButton(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onDismiss,
+                label = {
+                    Text(
+                        text = "取消",
+                        maxLines = 1,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                },
+            )
+        }
+    }
 }

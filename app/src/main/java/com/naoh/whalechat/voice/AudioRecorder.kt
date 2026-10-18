@@ -5,17 +5,11 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.abs
-import kotlin.math.log10
-import kotlin.math.sqrt
 
 /**
  * 本机录音。
@@ -36,14 +30,6 @@ class AudioRecorder {
     private val stopRequested = AtomicBoolean(false)
     private var active: AudioRecord? = null
 
-    private var lastLevel = 0f
-    private var lastLevelAt = 0L
-
-    private val _level = MutableStateFlow(0f)
-
-    /** 0..1 的实时音量，UI 拿它画电平条。只有录音期间有意义。 */
-    val level: StateFlow<Float> = _level.asStateFlow()
-
     /**
      * 开录，直到 [requestStop] 被调用、或者录满 [MAX_SECONDS]。
      *
@@ -56,9 +42,6 @@ class AudioRecorder {
         withContext(Dispatchers.IO) {
             check(active == null) { "正在录音" }
             stopRequested.set(false)
-            _level.value = 0f
-            lastLevel = 0f
-            lastLevelAt = 0L
 
             val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
             if (minBuffer <= 0) throw IllegalStateException("这个设备不支持 16kHz 单声道录音")
@@ -82,11 +65,9 @@ class AudioRecorder {
                     val read = instance.read(samples, 0, samples.size)
                     if (read <= 0) continue
 
-                    var sum = 0.0
                     val chunk = ByteArray(read * BYTES_PER_SAMPLE)
                     for (i in 0 until read) {
                         val value = samples[i].toInt()
-                        sum += value.toDouble() * value
                         // 小端序：低字节在前，WAV 就是这么定的
                         chunk[i * 2] = (value and 0xFF).toByte()
                         chunk[i * 2 + 1] = ((value shr 8) and 0xFF).toByte()
@@ -106,25 +87,19 @@ class AudioRecorder {
                         }
                     }
 
-                    // 电平条只要看着连续就行，没必要每帧都推：限到约 12 次/秒，
-                    // 变化够大时才立刻推（说话起头那一下得跟得上）。
-                    // 不节流的话录音期间每秒重组 20 次，在手表上纯属白烧电。
-                    val next = dbfs(sqrt(sum / read))
-                    val now = System.nanoTime() / 1_000_000
-                    if (now - lastLevelAt >= LEVEL_INTERVAL_MS ||
-                        abs(next - lastLevel) >= LEVEL_JUMP
-                    ) {
-                        lastLevel = next
-                        lastLevelAt = now
-                        _level.value = next
-                    }
+                    // ⚠️ 1.984：电平条已删（用户原话「干脆把声音起伏指示条删了，
+                    // 不仅有延迟还卡」）。原来这里每 ~80ms 把 dbfs 值推给 UI，
+                    // 每次都触发状态卡的重组+重绘 —— 在真机上是持续掉帧源，
+                    // 而用户要看的是 partial 的「边说边出字」，不是音量。**别再加回来。**
+                    // 1.992：电平条当年的数据源 `sum`（平方和，喂 dbfs() 的）也删了
+                    // —— 当时删了常量和 dbfs() 却漏了它，这里曾有 96 万次/分钟的
+                    // 无消费 double 乘加。别跟着 dbfs() 一起加回来。
                     pcm.write(chunk)
                 }
             } finally {
                 runCatching { instance.stop() }
                 instance.release()
                 active = null
-                _level.value = 0f
             }
 
             // 尾巴那点不足一片的也要交出去，否则最后一个字会被吞掉
@@ -162,11 +137,9 @@ class AudioRecorder {
         private const val BYTES_PER_SAMPLE = 2
         private const val MAX_PCM_BYTES = SAMPLE_RATE * BYTES_PER_SAMPLE * MAX_SECONDS
 
-        /** 电平推送的最小间隔，约 12 次/秒 */
-        private const val LEVEL_INTERVAL_MS = 80L
-
-        /** 变化超过这个幅度就立刻推 —— 说话起头那一下不能等 */
-        private const val LEVEL_JUMP = 0.15f
+        // ⚠️ 1.984：电平条（及其全部映射常量 LEVEL_INTERVAL_MS / LEVEL_JUMP /
+        // NOISE_FLOOR_DB / LOUD_DB / SILENT_FLOOR_FRACTION 与 dbfs()）已整个删除。
+        // 起因与经过见 record() 循环里那段注释。
 
         /**
          * 优先 VOICE_RECOGNITION 音源：系统会按「这是给识别用的」来走音频链，
@@ -184,18 +157,6 @@ class AudioRecorder {
                 instance.release()
             }
             throw IllegalStateException("麦克风不可用，可能被别的应用占着")
-        }
-
-        /**
-         * RMS → 0..1。
-         *
-         * 走 dB 而不是线性：线性刻度下正常说话只能把电平条推到最左边一小格，
-         * 看着像没收到音。映射到 -60dB..0dB 才符合直觉。
-         */
-        private fun dbfs(rms: Double): Float {
-            if (rms < 1.0) return 0f
-            val db = 20.0 * log10(rms / 32768.0)
-            return ((db + 60.0) / 60.0).coerceIn(0.0, 1.0).toFloat()
         }
 
         /**

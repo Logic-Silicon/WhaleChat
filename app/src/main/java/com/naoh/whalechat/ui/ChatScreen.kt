@@ -1,8 +1,7 @@
-package com.naoh.whalechat.ui
+﻿package com.naoh.whalechat.ui
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,18 +17,21 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
-import kotlin.math.roundToInt
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.ButtonDefaults
@@ -38,8 +40,7 @@ import androidx.wear.compose.material3.Card
 import androidx.wear.compose.material3.CardDefaults
 import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.Icon
-import androidx.wear.compose.material3.LinearProgressIndicator
-import androidx.wear.compose.material3.LinearProgressIndicatorDefaults
+import androidx.wear.compose.material3.EdgeButton
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.ScrollIndicator
@@ -48,8 +49,10 @@ import androidx.wear.compose.material3.TextButton
 import com.naoh.whalechat.data.ChatEngine
 import com.naoh.whalechat.data.ChatMessage
 import com.naoh.whalechat.data.ChatRole
+import com.naoh.whalechat.voice.AudioRecorder
 import com.naoh.whalechat.voice.VoicePhase
 import com.naoh.whalechat.voice.rememberVoiceInput
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
@@ -78,7 +81,19 @@ private val ACTION_ROW_WIDTH = 168.dp
  * 所以它**不是**「下边界」那件事的杠杆。用户说的「下边界有点点过了」
  * 靠 [UsageFooter] 上面的间隔来解（见那边的注释）。这里保持 48dp 不动。
  */
-private val BOTTOM_GAP = 48.dp
+/**
+ * 列表尾部留白。
+ *
+ * 1.978 第五轮：**48dp → 10dp**。底部现在由那颗 M3E 贴边返回按钮占着
+ * （`ScreenScaffold` 的 `edgeButton` 槽），而 `BOTTOM_GAP` 是给「没有底部按钮」时
+ * 留的尾部呼吸 —— 两份留白叠在一起，聊天页中段就空出一大片（实测 149px）。
+ * 减掉之后内容变短、列表少滚一点，**顶部那条 `top_gap` 也就露出来了**
+ * （用户要的「上边距和下边距协调」是同一件事的两面）。
+ *
+ * ⚠️ 别再往回调大：它排在 `usage` **下面**，是「用量那行」与屏幕底边之间唯一的分隔；
+ * 调回 48dp 的话那个分隔会被贴边按钮挤没。
+ */
+private val BOTTOM_GAP = 10.dp
 
 /**
  * 用量文字与它上面那颗「输入胶囊」之间的额外空隙。
@@ -213,11 +228,59 @@ fun ChatScreen(
     //
     // 发第一条消息时不用担心：下面那个 follow effect 会接管（follow 初始为 true），
     // 它按「条数 + 最后一条长度」触发，一样会跟到底。
-    LaunchedEffect(conversationId) {
+    //
+    // ## ⚠️⚠️ 2.0：定位目标从「列表最底」改成「**最后一条回答**」（用户原话：
+    // 「跳转后的页面位置就尽量刚好让最近一个回答位于页面的较上方处，差不多刚好能让
+    // 对方名字能显示屏幕 1/3 处，现在进去是在最底下，想看完整最近的回答得滑动」。
+    // 后续补充：「大概那个位置就行，以美观和可靠为主，不要全依赖 1/3」）。
+    //
+    //  * 旧行为 `scrollToItem(count - 1)` 停在**列表最末**（那排按钮/用量行）——
+    //    最后一条回答被顶到视口外或贴着底沿，要看它得往上滑。
+    //  * 新行为：找到**最后一条 ASSISTANT 消息**的索引，`scrollToItem(它, 向上偏移)`。
+    //    `ScalingLazyListState.scrollToItem` 的语义（库源码 ScalingLazyListState.kt）：
+    //    「把目标 item 带到**视口中心**，再按 scrollOffset 像素继续偏移，正值向上」⇒
+    //    负向偏移把中心抬向上方一点。偏移量取 **-140px**（视口 480 的 ~30%）：
+    //    目标行中心落在屏高 ~35% 处，保守取值——偏得再多（如 -170）在消息卡
+    //    很矮时会把它顶到时间胶囊底下。以「美观可靠」为先，不精确卡 1/3。
+    //  * **可靠性关键（1.993 实测踩了两版才踩对）**：`messages` 是异步加载的，
+    //    且它是**普通 val**（重组时重新求值）——**不能在 effect 闭包里读它**
+    //    （闭包捕获的是首帧的空列表，snapshotFlow 也不会重算普通 val）。
+    //    正确做法是把 `messages.size` 挂进 **effect 的 key**：数据加载完成 ⇒
+    //    size 0→N 变化 ⇒ effect 自动重启，此时闭包里的 `messages` 才是全的。
+    //  * **只定位一次**：用 `positioned` 旗子挡住后续重启。没有它的话，
+    //    流式追加（size 再变）会反复把用户拽回「最后一条回答」，
+    //    覆盖流式跟随 effect 的滚动。
+    //  * 没有 ASSISTANT 消息（只有用户问了还没回）⇒ 退回旧行为滚到最底，
+    //    因为此时「最新内容」就是那排操作按钮。
+    //  * 与下面那个「流式跟随」effect 的执行顺序：数据加载完成后两个 effect
+    //    都会重启（key 都变了）。重组期 effect 按声明顺序启动 ⇒ **本 effect 先滚**，
+    //    跟随 effect 后滚。跟随滚的是 `count-1`（最底）⇒ 会覆盖定位！
+    //    ⇒ `positioned` 旗子必须在这里**先置位**，让跟随 effect 那次重启
+    //    看到旗子直接 return。
+    var positioned by remember { mutableStateOf(false) }
+    LaunchedEffect(conversationId, messages.size) {
+        if (positioned) return@LaunchedEffect
         if (messages.isEmpty()) return@LaunchedEffect
-        val count = snapshotFlow { listState.layoutInfo.totalItemsCount }
-            .first { it > 0 }
-        listState.scrollToItem(count - 1)
+        val count = listState.layoutInfo.totalItemsCount
+        if (count <= 1) return@LaunchedEffect
+        positioned = true
+        val lastAssistant = messages.indexOfLast { it.role == ChatRole.ASSISTANT }
+        if (lastAssistant >= 0) {
+            // 消息 items 前面还有 1 个 top_gap ⇒ 列表索引 = 消息下标 + 1。
+            // ⚠️ scrollOffset 的真实语义（1.993 两轮实测校准，别凭文档猜）：
+            //  * 文档说 positive = item 更靠上，但**实测**：+140 把回答滚到顶满全屏
+            //    （角色名被时间胶囊盖住），-140 让回答落在 y≈236（屏高 49%）。
+            //    实测语义与文档相反（或「中心对位 + 偏移」的合成方向如此）。
+            //  * 目标：角色名（卡顶）在屏高 ~27%（y≈130）⇒ 从 -140 的 49% 再上抬
+            //    ~106px ⇒ **offset = -40**。
+            //  * 换 offset 前先真机量一下，两个方向的教训都在上面。
+            listState.scrollToItem(
+                index = lastAssistant + 1,
+                scrollOffset = -40,
+            )
+        } else {
+            listState.scrollToItem(count - 1)
+        }
     }
 
     // 流式追加时跟随：以「条数 + 最后一条长度」为触发点
@@ -230,7 +293,16 @@ fun ChatScreen(
         // 「按下面的按钮问点什么」和 11:20 叠在一起，第一行根本读不出来）。
         // 空会话没有任何「最后一条」值得跟，直接返回。
         if (messages.isEmpty()) return@LaunchedEffect
-        if (!follow) return@LaunchedEffect
+        if (!follow) {
+            return@LaunchedEffect
+        }
+        // ⚠️ 2.0：数据加载完成的那次重启（size 0→N）**让位给上面的定位 effect**——
+        // 否则它会 `scrollToItem(count-1)` 滚到最底，把「最后一条回答居上」的定位覆盖掉
+        //（1.993 实测踩过：定位 effect 先滚、跟随 effect 后滚，结果停在最底）。
+        // 流式期间（streaming=true）本 effect 的重启才是真正的「跟随」场景，照常工作。
+        if (!streaming && positioned) {
+            return@LaunchedEffect
+        }
         val count = listState.layoutInfo.totalItemsCount
         if (count > 0) listState.scrollToItem(count - 1)
     }
@@ -287,9 +359,37 @@ fun ChatScreen(
     )
 
     // 时间胶囊由外层 AppScaffold 统一提供，这里只用管滚动指示器
+    //
+    // ⚠️ 1.978 第五轮（用户要求）：底部加 **M3E 的贴边返回按钮**。
+    // 用的是 `ScreenScaffold` 的 `edgeButton` 槽（和扫码页那颗「返回」同一个组件），
+    // 所以它会**自动把 `contentPadding` 的底部撑开** —— 麦克风/键盘那一行因此被顶到
+    // 按钮上方，不用手写 padding。
+    //
+    // ⚠️ **它的官方语义是「随列表滚动调整大小」** —— 官方 Wear Lists 指南「列表中的边缘按钮」
+    // 一节原文：「使用 `edgeButton` slot 可确保按钮正确地贴在屏幕底部，
+    // **并在列表滚动时调整大小**」。聊天页默认就停在最底下（进来会 `scrollToItem(count-1)`），
+    // 所以正常情况下是满高；把对话往上翻到顶时它会缩掉 —— 这是组件行为，不是没做。
+    //
+    // ⚠️ **1.981（用户纠正）：不要去「钉死」这个高度。** 我一度用自定义
+    // `ScrollInfoProvider` 把 `lastItemOffset` 换成常数，把按钮固定成满高 —— 那是**反设计**的，
+    // 用户原话「谁让你把底部返回直接固定的」。已回退成官方的 `scrollState = listState`。
+    //
+    // 真正漏掉的是**官方示例里那一句 `Modifier.scrollable(...)`**：
+    // 不挂它，按钮会把落在它身上的触摸整个吃掉、和列表的滚动状态对不上，
+    // 于是 `ScreenScaffold` 的高度在 `snapTo / animateTo` 两个分支之间来回切。
+    // 现在五处贴边按钮统一挂 `Modifier.edgeButtonScrollable(listState)`（见它的 KDoc）。
     ScreenScaffold(
         scrollState = listState,
+        edgeButtonSpacing = BackEdgeButtonSpacing,
         scrollIndicator = { ScrollIndicator(state = listState) },
+        edgeButton = {
+            EdgeButton(
+                onClick = onBack,
+                modifier = Modifier.edgeButtonScrollable(listState),
+            ) {
+                Text("返回", style = MaterialTheme.typography.labelLarge)
+            }
+        },
     ) { contentPadding ->
         ScalingLazyColumn(
             modifier = Modifier.fillMaxSize(),
@@ -297,7 +397,9 @@ fun ChatScreen(
             contentPadding = contentPadding,
             autoCentering = null,
         ) {
-            item(key = "top_gap") { GapItem(20.dp) }
+            // 1.978 第五轮：20dp → 26dp。用户原话「上边距和下边距不协调了适当加一点点」。
+            // 底部现在由那颗贴边返回按钮占着，顶部还是原来那点留白，两边一比就偏紧。
+            item(key = "top_gap") { GapItem(26.dp) }
 
             if (conversation == null) {
                 // 到这里都是「看不到内容」但**没被明确删掉**的情况 —— 主要是下面两种，
@@ -393,13 +495,18 @@ fun ChatScreen(
                 item(key = "thinking") { ThinkingCard() }
             }
 
-            // 录音 / 上传期间给一条明确反馈。手表上按钮就那么大，
-            // 光靠图标换个形状说明不了「它到底在不在听」—— 音量条是最直接的证据。
+            // 录音 / 上传期间给一条明确反馈：状态一行 + 讯飞那条的「边说边出字」。
+            //
+            // ⚠️⚠️ **1.984：录音电平条已整个删除**（用户原话：「干脆把声音起伏指示条删了，
+            // 不仅有延迟还卡，位置也不要做保留」）——
+            // 它在真机上每 ~80ms 触发一次这张卡所在 item 的重组+重绘，**持续掉帧**，
+            // 而信息量远低于 [VoiceStatusCard.partial] 的「边说边出字」。
+            // **连它的常驻占位也一起删了**（那是为断「果冻」回路付的代价，条子没了占位就没理由存在；
+            // 回路不会回来 —— 这一条 item 删掉后与用量条互不影响，见 VoiceStatusCard 的 KDoc）。
             if (voice.phase != VoicePhase.IDLE) {
                 item(key = "voice") {
                     VoiceStatusCard(
                         phase = voice.phase,
-                        level = voice.level,
                         partial = voice.partial,
                     )
                 }
@@ -530,15 +637,31 @@ fun ChatScreen(
                 }
             }
 
-            // 划到最底下才出现的那行用量小字。两种模式（ask / chat）都显示：
-            // 数据已经记了（两种模式的会话都记），显示成本为零，
-            // ask 用户同样关心这个对话烧了多少。
+            // 划到最底下才出现的那行用量小字。
+            //
+            // ⚠️⚠️ **1.983：「果冻」的根因就在下面这几行里**（用户原话：
+            // 「底部返回按钮果冻自跳动 bug 没修 chat 页的」）。
+            // `visible` 传的是 `!listState.canScrollForward`（滚动状态），
+            // 所以 `UsageFooter` **绝不能拿它驱动布局** ——
+            // 一驱动布局就是「显隐改变内容高度 → 内容高度又决定 canScrollForward」的自激回路。
+            // 修法（只驱动 alpha）与完整机理见 `UsageFooter` 的 KDoc。**别改回去。**
+            //
+            // ⚠️ **1.980 第二轮（用户要求）：ask 的对话页不再显示这一行。**
+            // 用户原话：「把 ask 的对话页的具体 token 用量和命中率显示删掉，难看」。
+            // 判据沿用这一页本来就在用的那一条 —— `personaId` 为空 = 一次性问答（ask），
+            // 有角色 = 人设会话（chat，见 `WhaleChatApp` 里齿轮那个分叉用同一个判据）。
+            // **chat（人设会话）那一侧照旧显示**，`showUsageInChat` 开关的语义不变。
             //
             // 「显示设置」里的**「对话中的用量」**只管这一处。
             // 关掉时是**整行不存在** —— 不是变灰、也不是显示 0：变灰等于
             // 「有数据但我藏起来」，那是在替用户决定什么该看；用户关它就是因为不想看。
+            //
+            // ⚠️ ask 页这一行删掉之后，**数据仍然照记照存**（`promptTokens` 等键一个都没动），
+            // 只是不摆出来。**不要**顺手去删 `ConversationStore` 里的读写 ——
+            // 那是「读的改了、写的没跟上」的反向版本，会让 chat 侧也一起没数据。
+            val showUsageHere = settings.showUsageInChat && conversation.personaId != null
             val totalTokens = conversation.totalTokens
-            if (settings.showUsageInChat && totalTokens > 0L) {
+            if (showUsageHere && totalTokens > 0L) {
                 // ★ 这一条空隙就是「下边界」那件事的真正杠杆。
                 //
                 // 用量文字是列表里的一个 item，紧跟在 `actions`（输入胶囊那颗 item）后面，
@@ -554,11 +677,18 @@ fun ChatScreen(
                 // 保证文字不会被圆边切到（用户硬约束：「更不要收缩到显示不全 token 消耗量」）。
                 item(key = "usage_gap") { GapItem(USAGE_TOP_GAP) }
                 item(key = "usage") {
+                    // ⚠️⚠️ `visible` 这里传的是**滚动状态**（`!canScrollForward`），
+                    // 而 `UsageFooter` 内部**只拿它驱动 alpha、不碰布局** ——
+                    // 这两件事必须成对存在，否则就是 1.982 那个自激振荡（「果冻」）。
+                    // 详见 `UsageFooter` 的 KDoc：**别把那个函数改回 `AnimatedVisibility`**。
+                    //
+                    // ⚠️⚠️ 1.987：**命中率那一段整个删掉了**（用户原话：「chat对话页
+                    // 命中率删去」）。`UsageFooter.hitRate` 参数与 `usageText()` 里
+                    // 拼「· 命中 NN%」的分支一并移除 —— 数据（cacheHit/missTokens）
+                    // **照常记录**，只是不再摆出来；别顺手去删 ConversationStore 里的读写。
                     UsageFooter(
                         visible = !listState.canScrollForward,
                         tokens = totalTokens,
-                        // null（老对话 / 服务端没给 cache）= 命中率整段不出现。
-                        hitRate = conversation.cacheHitRate,
                     )
                 }
             }
@@ -729,86 +859,164 @@ private fun MessageCard(
 }
 
 /**
- * 对话页底部那行「本对话已用 xx tokens」。
+ * 对话页底部那行「已用 xx tokens」。
  *
- * 只在**划到最底下**时出现（`visible = !canScrollForward`），往上滑一点就淡出。
+ * ## ⚠️⚠️ 1.983：**这个函数的实现是修「果冻」的核心，别改回去**
+ *
+ * 1.982 及以前这里写的是：
+ * ```kotlin
+ * AnimatedVisibility(visible = visible, enter = fadeIn(spec), exit = fadeOut(spec)) { Text(…) }
+ * ```
+ * 而调用点传进来的 `visible` 是 **`!listState.canScrollForward`** ——
+ * 于是构成了一条**自激振荡回路**：
+ * ```
+ * canScrollForward 变化
+ *   → visible 变化
+ *     → AnimatedVisibility 增删/改变高度      ← 它在淡入淡出期间**高度也在连续变**
+ *       → 列表内容总高度变化
+ *         → canScrollForward 变化   ←──── 回到起点，自激、每帧都在推
+ * ```
+ * 症状就是用户两轮都在说的：**底部返回按钮「像果冻一样自己一直上下起伏」**，
+ * 而**滑到最底下就正常**（那时 `canScrollForward == false` 是稳定解，回路失去驱动力）。
+ *
+ * ### 修法的唯一要点：**`visible` 只驱动 `alpha`，绝不再驱动布局**
+ *
+ * 现在这个 item **永远存在、高度恒定**（`Text` 一直在，只是透明），
+ * 所以 `canScrollForward` 不再被它影响 ⇒ **回路从根上断开**。
+ *
+ * ⚠️⚠️ **不要再改回 `AnimatedVisibility`**，也不要改成任何
+ * 「显隐会改变列表内容高度」的写法。这条已经在提示词 §D.5 升格为**硬约束**：
+ * > 一个 item 的「显隐」如果改变列表内容高度，而它的显隐又是读列表滚动状态算出来的，
+ * > 就会自激振荡。这类「visibility 由它自己影响的量驱动」的写法，
+ * > 在 `ScalingLazyColumn` / `LazyColumn` 里**一律禁止**。
+ *
+ * ### 代价（**这是必要取舍，不是缺陷**）
+ *
+ * 底部会**常驻一条约一行高**的空位（`alpha=0` 时 `Text` 仍在、仍占位）。
+ * 不这么做就只能让布局随显隐变化，而那正是回路本身。
+ * 实测满高 = 一行 `labelSmall` ≈ 39px（18dp），在 240dp 的屏上是可接受的代价；
+ * 换来的是**按钮高度极差从 33px 变成 0px**。
+ *
+ * ## 为什么不干脆「常显、连 alpha 都不要」（提示词里的备选 B）
+ *
+ * **查证结果：「划到最底下才出现」是用户明确要求过的，不是实现者的自作主张。**
+ * 证据在会话目录 `whalechat-1.907-prompt.md:364`：
+ * > | `UsageFooter` 只在 `canScrollForward == false` 时出现 | **用户明确定过：「得划到最底下才触发显示」** |
+ * ⇒ 备选 B（去掉 `visible` 参数、恒定 `alpha = 1`）**会删掉一个用户明确要过的行为**，
+ * 所以**不采用**。保留淡入淡出观感、只把驱动方式从「布局」换成「透明度」，
+ * 是既守住用户要求、又断掉回路的唯一组合。
+ *
+ * ## 其它保持不变的语义（都别顺手改）
+ *
  * 只显示最终总量，**不显示「上轮 xx」** —— 那会把一行小字塞进两个数字，反而更费读。
  *
- * **这一行末尾还会挂一个缓存命中率**（`· 命中 87%`，[usageText] 拼的）。
- * 它是「输入里有多少是命中缓存的」—— 命中那一档比未命中便宜一个数量级，
- * 所以长对话省钱的大头就在这个比例上。数据来自 usage 里本来就返回的
- * `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`。
+ * ## ⚠️⚠️ 1.987：**缓存命中率整段删除**（用户原话：「chat对话页命中率删去」）
  *
- * ⚠️ **[hitRate] 为 null 时命中率整段不出现**（老对话 / 服务端没给 cache 字段），
- * 那一行就跟总量文案一样。不要把它显示成「命中 0%」——
- * 「没统计过」和「真的一字未命中」是两件事，混起来看着就是个 bug。
- * **也不给它单加开关**：它跟着「对话中的用量」走，那个关掉这整行就没了。
+ * 原来 `UsageFooter` 有第三个参数 `hitRate`（[usageText] 拼 `· 命中 NN%`），
+ * 现在参数和那个分支**一并移除**。
+ *
+ * ⚠️ **数据照常记录**：`Conversation.cacheHitTokens` / `cacheMissTokens` 的
+ * 记录链路（`StreamEvent.Usage` → `addUsage` → `ConversationStore`）**一个字没动**——
+ * 用户要的是「不显示」，不是「不统计」。别顺手去删那些读写。
+ *
+ * ⚠️ **联动改过的注释**：1.979 那段「缓存命中率默认看得见」的历史说明
+ * 已随本条失效（那段说的就是现在删掉的东西），保留在 [usageText] 删除处
+ * 的历史注释里，不再在 KDoc 里保留「它看得见」的表述。
  *
  * **显不显示由「对话中的用量」控制**（`Settings.showUsageInChat`）。
  * 那个开关关掉时**整行不存在**（调用点直接不渲染这个 item），不是变灰、也不是显示 0。
  * 注意：原来那个管两处的 `showTokenUsage` 已拆成两个开关，
  * 这一处归「对话中的用量」，角色列表那一处归「角色列表的用量」。
  *
- * ⚠️ **这个开关默认关**，而它的入口（「显示设置」二级页）也一并隐藏了
- * ⇒ **默认状态下这行看不到，这是预期**。
- * 改默认值看 `SettingsStore.applyDisplayDefaults`，恢复入口看
- * `SettingsScreen.SHOW_DISPLAY_SETTINGS_ENTRY`。
+ * ⚠️ **1.981：ask 的对话页连这个 item 都不渲染**（用户原话「把 ask 的对话页的具体
+ * token 用量和命中率显示删掉，难看」）。判据是 `conversation.personaId != null` ——
+ * 也就是**只有 chat（人设会话）那一侧还看得到这一行**。所以现在有两道闸：
+ * `personaId != null`（哪一侧）**且** `showUsageInChat`（开关）。
+ *
+ * ⚠️ **这个开关默认开**（1.979 从「默认关」翻过来的），而它的入口
+ * （「显示设置」二级页）**仍然隐藏** ⇒ **默认状态下 chat 那一侧是看得到的**，这是预期。
+ * 改默认值看 `SettingsStore.applyDisplayDefaults`（**第 1979 次覆盖**那一段），
+ * 恢复入口看 `SettingsScreen.SHOW_DISPLAY_SETTINGS_ENTRY`。
  *
  * 淡入淡出用 Wear M3 的动效规范 `defaultEffectsSpec`（专管透明度/颜色这类「效果」），
  * 不手写 `tween`。理由和首页那行模式提示一样：把 M3 在低功耗设备上对时长与缓动的
  * 取舍丢掉、也失去跟主题一起变的能力，不划算。
+ * ⚠️ 1.983 换掉 `fadeIn/fadeOut` 之后，这个 spec 仍然是**同一个**
+ * （`defaultEffectsSpec<Float>()` 本来就是给透明度这类效果用的），只是改成喂给
+ * `animateFloatAsState` —— 动效观感与之前一致，**别换成 `tween`**。
  *
  * ⚠️ 这个 `Text` **故意不加 `maxLines` / `overflow` / 固定 `width`**：
  * 它是 `fillMaxWidth()` + 居中，放不下时只会**换行**（信息不丢），而不是被裁掉。
  * 之前字被裁成 `06:`，是因为那里硬写了 `Modifier.width(22dp)` 把盒子压窄了 ——
  * 这里没有那个东西，**也不要为了「防换行」把它加上去**（那才会真的裁字）。
- * （实测「本对话已用 … · 命中 87%」确实会换行，处理方式是**缩文案**，
- * 见 [usageText] 的注释 —— 不是加这两样。）
+ *
+ * ⚠️ **1.987 命中率删掉后，这行文字变短了** —— 原来那句「已用 … · 命中 87%
+ * 会换行、处理方式是缩文案」的历史教训随 hitRate 一起失效，
+ * 现在「已用 xx tokens」在任何宽度下都是单行。
+ *
+ * ⚠️ **换行会让这个 item 变高**（一行 ↔ 两行）—— 这**不会**重新引入回路：
+ * 高度只由**文案长度**决定，而文案只跟 `tokens` 有关，
+ * **跟滚动位置无关**。回路的前提是「驱动量由它自己影响」，
+ * 这里驱动量是数据、不是滚动状态。
  */
 @Composable
-private fun UsageFooter(visible: Boolean, tokens: Long, hitRate: Float?) {
+private fun UsageFooter(visible: Boolean, tokens: Long) {
+    // ⚠️ 用 `defaultEffectsSpec<Float>()` —— 它就是 M3 给「透明度/颜色这类效果」用的，
+    // 和原来 `fadeIn/fadeOut(spec)` 拿到的是同一条曲线。
     val spec = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn(animationSpec = spec),
-        exit = fadeOut(animationSpec = spec),
-    ) {
-        Text(
-            text = usageText(tokens, hitRate),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center,
-        )
-    }
+    val alpha by animateFloatAsState(
+        targetValue = if (visible) 1f else 0f,
+        animationSpec = spec,
+        label = "usageFooterAlpha",
+    )
+    Text(
+        text = usageText(tokens),
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .fillMaxWidth()
+            // ★★ 只动 alpha，**不碰布局** —— 这是断掉自激回路的那一下。
+            // ⚠️ 不要用它换回 `AnimatedVisibility` / `if (visible) { … }` 之类
+            // 任何会改变高度的写法。
+            .graphicsLayer { this.alpha = alpha },
+        textAlign = TextAlign.Center,
+    )
 }
 
 /**
  * 底部那行用量文字的拼法。
  *
- * [hitRate] 为 null ⇒ 只有总量。见 [UsageFooter] 的注释：
- * null 是「没统计过」，**不是**「命中率为 0」。
- *
  * ⚠️ **前缀是「已用」不是「本对话已用」**（实测后定的，见下）。
  *
  * 240dp 圆屏里这一行的**实测可用宽只有 189dp**（`fillMaxWidth` 拿到的
  * bounds 是 378px ÷ density 2.0 —— 两侧 contentPadding 比提示词估的还多）。
- * 而 ` · 命中 87%` 本身就占 ~50dp，于是「本对话已用 20.4k tokens
- * · 命中 87%」实测**换行成两行**（`命` / `中 87%` 被拆开，截图可见）。
+ * 原来 ` · 命中 87%` 那段还会再占 ~50dp，把整行挤成两行 ——
+ * **1.987 命中率整段删掉后这个问题连根消失**（用户原话：「chat对话页命中率删去」），
+ * 剩下的「已用 xx tokens」在最窄的宽度上也放得下。
  *
- * 所以按降级顺序**走了第一步：去掉「本对话」**
- * （`已用 20.4k tokens · 命中 87%`，~91dp）。
  * 这里**没有缩字号、没有加 `maxLines`、没有加固定宽度** ——
  * 那三样都会把「换行」变成「裁字」，是这个项目栽过的坑。
+ *
+ * ## ⚠️ 已删除的 `hitRate` 参数（1.987）
+ *
+ * 原来这里有第二个参数 `hitRate: Float?`（null = 没统计过，不显示），
+ * 拼 `· 命中 NN%`。用户要求整段删去 ⇒ 参数与分支一并移除。
+ * **数据链路（cacheHit/missTokens 的记录）没有动** —— 只是不再显示。
  */
-private fun usageText(tokens: Long, hitRate: Float?): String {
-    val base = "已用 ${formatTokens(tokens)} tokens"
-    val rate = hitRate ?: return base
-    // `100%` 与 `0%` 都是合法结果（全命中 / 一个都没命中），都不许特判。
-    val pct = (rate * 100f).roundToInt().coerceIn(0, 100)
-    return "$base · 命中 $pct%"
-}
+private fun usageText(tokens: Long): String = "已用 ${formatTokens(tokens)} tokens"
 
+/**
+ * 「正在思考…」那张卡。
+ *
+ * 1.978 在文字上面补一个 **M3E 波浪形圆形进度指示器**（`WavyProgressIndicator`，
+ * 移植自 `material3_indicators` 的 `WavyCircularProgressIndicator`）。
+ * 原来这里只有一行字，但「正在思考」本质上就是一次不确定的等待 —— 没有动的东西
+ * 用户没法判断应用是活着还是卡住了（尤其思考档首包本来就慢）。
+ * 与捏人等待页用的是同一个组件，两处的等待语言从此一致。
+ *
+ * 直径取 34dp（不是等待页的 56dp）：这张卡是**列表里的一项**，会被
+ * `ScalingLazyColumn` 按位置缩放，本身还占着一屏；小一圈才不至于把消息列表挤掉一行。
+ */
 @Composable
 private fun ThinkingCard() {
     // Wear M3 的 Card 只有「可点击」一种重载，没有静态版本 ——
@@ -823,12 +1031,20 @@ private fun ThinkingCard() {
             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
         ),
     ) {
-        Text(
-            text = "正在思考…",
-            style = MaterialTheme.typography.bodyMedium,
+        Column(
             modifier = Modifier.fillMaxWidth(),
-            textAlign = TextAlign.Center,
-        )
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            WavyProgressIndicator(diameter = 34.dp)
+            Text(
+                text = "正在思考…",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 6.dp),
+                textAlign = TextAlign.Center,
+            )
+        }
     }
 }
 
@@ -842,9 +1058,38 @@ private fun ThinkingCard() {
  * [partial] 是流式识别的中间结果（讯飞那条才有）。把它显示出来是有意为之：
  * 「边说边出字」如果只在识别完才给结果，用户没法判断机器到底听对没有，
  * 而这个页面又没有输入框可以回看 —— 中间结果就是唯一的证据。
+ *
+ * ## ⚠️⚠️ 1.984 → 1.985：电平条「修好 → 删除」的完整轮回（防止后人再走一遍）
+ *
+ *  * **1.984 修好过一次**：原 `LinearProgressIndicator` 的公开包装**内部带补间动画**
+ *    （库源码 `LinearProgressIndicator.kt:85-94`，`Animatable` + `animateTo`，靠 vsync 帧
+ *    回调推进），而 `AudioRecorder.dbfs()` 又用 −60 dB 当下限把静音一律夹成 0 ⇒
+ *    **条子恒为 0 且动画在慢设备上推不动**，双重原因叠加成「静止不动」；
+ *  * 修法是「自绘无补间 + 重映射 −75~−10 dB」—— **模拟器上确实画出来了**（53px 稳定段），
+ *    但**真机用户实测：「不仅有延迟还卡」**。真机的电平每 ~80ms 跳一次、
+ *    每次都触发这张卡所在 item 的重组 + 重绘，在手表的低端 GPU 上就是持续掉帧；
+ *    而它提供的信息量（「麦克风收到了多大声音」）远低于 `partial` 的「边说边出字」
+ *    —— 用户要看的是**识别得对不对**，不是**声音有多大**；
+ *  * **1.985 用户拍板删除**：「干脆把声音起伏指示条删了，不仅有延迟还卡，位置也不要做保留」。
+ *    电平条与其数据管线（`AudioRecorder` 的 `level` StateFlow、`dbfs()` 及全部映射常量）
+ *    **整条删除**；同时 `AudioRecorder` 录音循环里那段每 80ms 推一次 UI 的逻辑也删了
+ *    —— 它正是「卡」的来源。替换它的是 [RecordingCountdownBar]（**每秒才变一次**的
+ *    倒计时条），见那个函数的 KDoc（为什么它不会重蹈覆辙）。
+ *
+ * ⇒ **结论：删除 + 换成倒计时条。** 1.984 那条**常驻占位**（为断「果冻」回路
+ * 而引入的 ~39px 空位）也随电平条一起删了；现在这张卡的高度**只由文字与 partial 决定**。
+ *
+ * ⚠️⚠️ **「果冻」回路会不会回来？—— 不会。** 上一轮的回路是
+ * 「`visible` 读滚动状态 → `AnimatedVisibility` 改变高度 → 又影响滚动状态」。
+ * 现在用量条那两个 item（`usage`/`usage_gap`）在 `showUsageHere=false` 时不渲染
+ * （1.981 起如此），与本卡互不影响 ⇒ **没有反馈回路**。
+ * 验证见 `WHALECHAT_1.984_实现报告.md` 的果冻复测（三位置逐帧差异 0px）。
+ *
+ * @param phase 录音 / 识别阶段（决定文案 + 要不要出倒计时条）。
+ * @param partial 流式识别的中间结果（讯飞那条才有；通用接口/系统识别为空）。
  */
 @Composable
-private fun VoiceStatusCard(phase: VoicePhase, level: Float, partial: String) {
+private fun VoiceStatusCard(phase: VoicePhase, partial: String) {
     val scheme = MaterialTheme.colorScheme
     Card(
         onClick = {},
@@ -866,7 +1111,7 @@ private fun VoiceStatusCard(phase: VoicePhase, level: Float, partial: String) {
             )
             if (phase == VoicePhase.RECORDING) {
                 Spacer(Modifier.height(6.dp))
-                LevelMeter(level)
+                RecordingCountdownBar()
             }
             if (partial.isNotBlank()) {
                 Spacer(Modifier.height(6.dp))
@@ -883,22 +1128,83 @@ private fun VoiceStatusCard(phase: VoicePhase, level: Float, partial: String) {
 }
 
 /**
- * 录音电平条。
+ * 录音倒计时条：显示 **60 秒上限还剩多少**。**1.985 新增**（用户原话：
+ * 「刚启动语音识别没有输出的时候留白过大有点丑，干脆就做个 60s 的录音倒计时指示条，
+ * 有点走回头路的感觉（但只是显示剩余输入时间）」）。
  *
- * 用 Wear M3 的 `LinearProgressIndicator`，不再手绘两个叠起来的 Box：
- *  * 它本来就是「一条轨道 + 一段进度」的语义，电平条要做的事一模一样；
- *  * 圆头、端点那颗小圆点、主色 / 容器色、粗细 token 都是 M3 定好的 ——
- *    手绘那版这些数全是我自己凑的，跟主题色板对不上，换主题也不会跟着走；
- *  * `strokeWidth` 只能给到 [LinearProgressIndicatorDefaults.StrokeWidthSmall]（8dp），
- *    那是它保证端点圆点还看得见的底线，硬压更细会画出畸形。
+ * ## 为什么这次**不会**重蹈电平条的覆辙（「又延迟又卡」）
  *
- * 值必须 coerceIn —— 浮点误差会让它偶尔略微越过 1。
+ * 电平条卡的三个原因，这条倒计时**一个都不沾**：
+ *
+ *  1. **更新频率**：电平值 ~12 次/秒地跳 ⇒ 每跳都重组+重绘；倒计时**每 1 秒才变一次**
+ *     （60 秒里只重组 60 次），对手表 GPU 是零负担；
+ *  2. **动画依赖**：电平条当时撞上的是「库的补间动画等 vsync 帧回调、模拟器不给帧」。
+ *     这条**不用库组件**（那次的另一个坑：`LinearProgressIndicator` 的
+ *     `trackBrush`/`DotRadius` 等全是 internal，1.984 编译错实测），
+ *     而是**自己按 M3 语义画**（几何与颜色 token 全部对齐库源码，与 1.984 那版一致），
+ *     **值变当帧就画**，中间没有任何动画/帧回调依赖；
+ *  3. **确定进度**：它画的是「已录时长 / 60s」这个**单调确定**的量，
+ *     不会像电平值那样忽上忽下，观感是「平稳走条」而不是「闪」。
+ *
+ * ## 语义
+ *
+ * 「走回头路」用户自己也说了 —— 对，它**看起来**像最早那版的不定进度条，
+ * 但表达的东西不同：**单次录音最多 60 秒**（[AudioRecorder.MAX_SECONDS]，讯飞那边
+ * 整个会话也 60 秒封顶）⇒ 剩余时间是一条**真实存在**的硬约束。
+ * 把它画出来，用户就知道「还能说多久」，也解释了「为什么说着说着自己停了」。
+ *
+ * ## 实现
+ *
+ * * **每秒自推**（`LaunchedEffect` + `delay(1000)`），不押在帧回调上 ——
+ *   理由同 `WavyProgressIndicator` 的 KDoc（模拟器不给帧，`delay` 走主线程 Handler
+ *   会自己把帧要出来）；
+ * * **进度从满往空走**（剩余比例）：开始录音时是满的，随时间变短，
+ *   走完即 60 秒到顶（`AudioRecorder` 会自己停）。
+ * * `remember(stopRequestedAtMs)` 以「进 RECORDING」为 key 重置计时。
  */
 @Composable
-private fun LevelMeter(level: Float) {
-    LinearProgressIndicator(
-        progress = { level.coerceIn(0f, 1f) },
-        modifier = Modifier.fillMaxWidth(),
-        strokeWidth = LinearProgressIndicatorDefaults.StrokeWidthSmall,
-    )
+private fun RecordingCountdownBar() {
+    // 已录秒数。key 给 Unit：进这张卡（= 进 RECORDING）时从头计。
+    var elapsedSec by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (elapsedSec < AudioRecorder.MAX_SECONDS) {
+            delay(1_000)
+            elapsedSec += 1
+        }
+    }
+
+    val scheme = MaterialTheme.colorScheme
+    val strokeWidth = 8.dp   // 与库 StrokeWidthSmall 一致（token 是 internal，值对齐）
+    val total = AudioRecorder.MAX_SECONDS.toFloat()
+    val remaining = (total - elapsedSec).coerceAtLeast(0f)
+
+    Canvas(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(strokeWidth)
+            .padding(2.dp),   // 库的 OuterHorizontalMargin（internal，值对齐）
+    ) {
+        val progressPx = (remaining / total) * (size.width - strokeWidth.toPx())
+        val capOffset = strokeWidth.toPx() / 2f
+        val cy = size.height / 2f
+
+        // 底轨（满宽，画的是「总时长」）
+        drawLine(
+            color = scheme.surfaceContainer,
+            start = Offset(capOffset, cy),
+            end = Offset(size.width - capOffset, cy),
+            strokeWidth = strokeWidth.toPx(),
+            cap = StrokeCap.Round,
+        )
+        // 剩余时间（从满往空走）
+        if (progressPx > 0f) {
+            drawLine(
+                color = scheme.primary,
+                start = Offset(capOffset, cy),
+                end = Offset(capOffset + progressPx, cy),
+                strokeWidth = strokeWidth.toPx(),
+                cap = StrokeCap.Round,
+            )
+        }
+    }
 }

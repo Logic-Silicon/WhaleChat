@@ -37,6 +37,18 @@ data class PersonaPreset(
     val subtitle: String,
     val description: String,
     val fields: List<PresetField>,
+    /**
+     * 非 null ⇒ 这个预设**不经过模型**，直接落一条写死的角色。
+     *
+     * 目前只有「大肥鱼」用它（理由见 [BuiltinPersonas] 的注释）。这条旁路必须存在，
+     * 因为那个预设的六块是用户给的**定稿**：再让模型编一遍就是另一条鱼了，
+     * 而且每次安装还不一样、还要花钱、还要等一次网络往返。
+     *
+     * 用 `() -> Persona` 而不是直接塞一个 [Persona] 常量：`createdAt` 要在
+     * **点下去的那一刻**取，否则「刚加的角色」会顶着一个编译期的旧时间戳，
+     * 在通讯录里排到它该在的位置之外（排序键见 [Persona.sortKey]）。
+     */
+    val direct: (() -> Persona)? = null,
 )
 
 /**
@@ -82,7 +94,7 @@ data class PresetDraft(
 }
 
 /**
- * 三个预设。
+ * 预设列表。**顺序就是界面上从上到下的顺序。**
  *
  * **预设里不许出现任何第三方作品的虚构角色名。** 用户自己在描述框里写「我要跟某人聊天」，
  * 那是用户输入；我们把它做成**预置选项**，等于在产品里内置第三方 IP 的入口，
@@ -95,8 +107,34 @@ data class PresetDraft(
  * 措辞一律中性（「说话温柔、很会照顾对方情绪的人」这种），避开容易让模型往暧昧或
  * 性化方向发挥的词。**我们不做内容护栏** —— 生成内容走 DeepSeek API，由用户负责；
  * 但预设文案是我们自己写的，分寸由我们把握。
+ *
+ * ## ⚠️ 大肥鱼为什么排第一
+ *
+ * 用户 2026-10-18 明确要求「放在创建人设功能中的预设第一项」。
+ *
+ * 它和其余四个预设**不是同一类东西**：那四个是「模板」，进去还要填字段、按生成、
+ * 等模型现编；大肥鱼是**成品**，点一下就落一条完整的角色（[PersonaPreset.direct]）。
+ * 排序上把它放第一位，是因为它是这个版本的主打 —— 但它**不占用**「自己说一句」那条路，
+ * 两条路仍然并列在页面上。
+ *
+ * 那条「预设里不许出现第三方 IP」的约定**不适用于大肥鱼**，理由不是网开一面，
+ * 而是：大肥鱼是 DeepSeek 的**社区二创拟人化形象**，不是某个第三方作品的角色。
+ * 本项目是 DeepSeek 的非官方客户端，内置它属于同主题的自发创作。
+ * 真要说边界，是「不要把它写成 DeepSeek 官方出品」—— 所以它的
+ * [Persona.sourceDescription] 里写的是「拟人化二创」，不是「官方角色」。
  */
 private val PRESETS: List<PersonaPreset> = listOf(
+    PersonaPreset(
+        title = "大肥鱼",
+        subtitle = "吃白饭的AI女仆",
+        // description / fields 对这条旁路是**不用的**（见 direct）。
+        // 留空字符串而不是留一句占位文案：万一将来有人误把它接回生成管道，
+        // 空描述会当场在 PersonaFactory 里被拦下（「先说说你想要什么样的人」），
+        // 而不是悄悄捏出一个莫名其妙的角色。
+        description = "",
+        fields = emptyList(),
+        direct = { BuiltinPersonas.fish() },
+    ),
     PersonaPreset(
         title = "辅助学习的老师",
         subtitle = "讲得清、会追问，陪你把题弄懂",

@@ -1,5 +1,6 @@
 package com.naoh.whalechat.net
 
+import com.naoh.whalechat.BuildConfig
 import com.naoh.whalechat.data.ChatMessage
 import com.naoh.whalechat.data.ChatRole
 import kotlinx.coroutines.Dispatchers
@@ -20,8 +21,27 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/** DeepSeek 官方 API 地址（OpenAI 兼容）。 */
-const val DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+/**
+ * DeepSeek 官方 API 地址（OpenAI 兼容）。
+ *
+ * ## ⚠️ 1.983：从 `const val` 改成**读 `BuildConfig`**，为了让它「可测」
+ *
+ * 默认值**就是官方地址**，release 与 debug 都一样 —— 行为与 1.982 逐字相同
+ *（R8 会把常量内联，dex 里看到的就是那串字面量）。
+ *
+ * 改动的唯一目的：**让本地端到端验收成为可能**。
+ * 联网搜索那条链路要证明「搜索资料确实拼进了发给模型的请求里」，
+ * 而证据最强的方式是**让一个假 chat 服务把收到的请求体打出来**（机理级证明，
+ * 比「截图上看着答对了」硬得多）。地址写死成 `const` 就做不到这件事。
+ *
+ * 出包时用 `-PchatBaseUrl=http://127.0.0.1:8902` 指到假服务；**不带就是官方地址**。
+ * ⚠️ 正式出包**绝不带**这个参数（`build_release.sh` 里没有它），
+ * 交付时用 dex 字符串抽查核对包内是官方地址。
+ *
+ * ⚠️ 它同时被 [com.naoh.whalechat.data.UsageStore] 的余额查询用着
+ *（两者本来就共用同一个 base）⇒ 改它会**一起**指过去，这是符合预期的。
+ */
+val DEEPSEEK_BASE_URL: String = BuildConfig.CHAT_BASE_URL.trimEnd('/')
 
 /**
  * 当前通用模型：DeepSeek-V4.1-Flash。

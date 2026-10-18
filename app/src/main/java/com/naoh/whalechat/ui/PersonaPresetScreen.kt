@@ -25,6 +25,8 @@ import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.ScrollIndicator
 import androidx.wear.compose.material3.Text
 import com.naoh.whalechat.data.ChatEngine
+import com.naoh.whalechat.data.Persona
+import com.naoh.whalechat.data.PersonaPreset
 import com.naoh.whalechat.data.personaPresets
 
 /**
@@ -46,14 +48,26 @@ import com.naoh.whalechat.data.personaPresets
  * 点某一行 → 进 InputScreen 改 → 改完回到这页（字段值存在 ChatEngine.presetDraft 里，
  * 跨导航活着）→ 按生成。
  *
+ * ## ⚠️ 两种预设，两种结局
+ *
+ * 带 [PersonaPreset.direct] 的预设（目前只有「大肥鱼」）是**成品**：没有字段可改、
+ * 也不该联网现编 —— 点一下就落一条写死的角色，直接进聊天页。
+ * 这一页对它们退化成「一个确认页」：上面是说明，下面一颗「添加」。
+ *
+ * 为什么仍然复用这一页而不是另开一页：用户在「造一个角色」列表里点的是一个**预设**，
+ * 落到哪一页应该由预设自己决定，而不是让用户在列表上分辨「这两个按钮长得不一样」。
+ * 页内分叉只有一条 `if`，比多一条路由 + 多一次导航可靠。
+ *
  * @param onEditField 去输入页改第 [onEditField] 个字段（参数是字段的 key）
  * @param onGenerate 拿着拼好的那句描述去等待页
+ * @param onAddDirect 成品预设：直接把 [Persona] 落库，参数是那条角色
  */
 @Composable
 fun PersonaPresetScreen(
     presetIndex: Int,
     onEditField: (fieldKey: String) -> Unit,
     onGenerate: (description: String) -> Unit,
+    onAddDirect: (Persona) -> Unit,
 ) {
     val listState = rememberScalingLazyListState()
     val presets = personaPresets()
@@ -81,9 +95,64 @@ fun PersonaPresetScreen(
 
     // 进页面铺一份草稿。**同一个预设不重铺** —— 去输入页改一行再回来时这一页会被
     // 销毁重建，无条件重铺会把用户改过的另外几行一起冲回默认值。
-    LaunchedEffect(presetIndex) { ChatEngine.beginPresetDraft(presetIndex) }
+    //
+    // 成品预设（fields 为空）不铺草稿：它没有字段可改，铺了只会让 `current` 非 null、
+    // 让下面那些 `if (isDirect)` 的判断多一种要防的状态。
+    LaunchedEffect(presetIndex) {
+        if (preset.direct == null) ChatEngine.beginPresetDraft(presetIndex)
+    }
 
     val current = draft?.takeIf { it.presetIndex == presetIndex }
+
+    // 成品预设：没有字段、不联网、点一下直接落库。
+    if (preset.direct != null) {
+        ScreenScaffold { contentPadding ->
+            ScalingLazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                state = listState,
+                contentPadding = contentPadding,
+                autoCentering = null,
+            ) {
+                item(key = "top_gap") { GapItem(28.dp) }
+
+                item(key = "add") {
+                    Button(
+                        onClick = { onAddDirect(preset.direct.invoke()) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = "添加",
+                            maxLines = 1,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+
+                item(key = "about_header") {
+                    ListSubHeader { Text("关于 TA") }
+                }
+
+                item(key = "about") {
+                    HintText(
+                        "蓝发蓝瞳、有鲸鱼尾巴的少女女仆，自封的 AI 天才。" +
+                            "消耗 Token 时一本正经，干起活来偶尔摸鱼，被叫「吃白饭」会当场炸毛。" +
+                            "称呼你为「鱼片」。",
+                    )
+                }
+
+                item(key = "note") {
+                    HintText(
+                        "TA 的人设是写好的成品，不用联网生成、也不花钱。" +
+                            "添加之后在通讯录里，随时可以改名字或删掉。",
+                    )
+                }
+
+                item(key = "bottom_gap") { GapItem(28.dp) }
+            }
+        }
+        return
+    }
 
     ScreenScaffold(
         scrollState = listState,
@@ -164,8 +233,7 @@ fun PersonaPresetScreen(
  * 留白的话用户分不清是「这一项还没填」还是「这一项不需要填」。
  */
 @Composable
-private fun FieldRow(
-    label: String,
+private fun FieldRow(    label: String,
     value: String,
     placeholder: String,
     onClick: () -> Unit,
