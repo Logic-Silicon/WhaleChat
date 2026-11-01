@@ -1,8 +1,13 @@
-﻿package com.naoh.whalechat.ui
+package com.naoh.whalechat.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -24,9 +29,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,9 +62,12 @@ import com.naoh.whalechat.voice.AudioRecorder
 import com.naoh.whalechat.voice.VoicePhase
 import com.naoh.whalechat.voice.rememberVoiceInput
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 底部操作区的宽度。
@@ -113,6 +125,48 @@ private val USAGE_TOP_GAP = 10.dp
  */
 private val ACTION_GAP = 4.dp
 
+/**
+ * 进对话页时，「最近一条回答」这张卡的**上沿**该落在屏幕顶部往下多少（dp）。
+ *
+ * ## 为什么是 66dp（340dpi 下 ≈140px）
+ *
+ * 圆屏 480px、半径 240、圆心 (240,240)。宽 `W` 的元素整条落进圆的纵向区间是
+ * `y ∈ [240 ± sqrt(240² − (W/2)²)]` —— **越宽越窄**。
+ * 消息卡是 `fillMaxWidth` 的：这屏的可用宽实测 **428px**（`[26,454]`），
+ * 代入得 `y ∈ [131, 349]`。所以气泡上沿必须 **≥131px**，否则左右两侧会被圆边切掉
+ * —— 这正是用户截图里「文字块左右都被圆屏边缘裁掉」的几何原因。
+ *
+ * 取 **145px**（68dp）：比下界高 14px、留得出安全边；又远在时间胶囊（墨迹底约 36px）
+ * 之下；而且 140px 在 `[131,349]` 的中段偏上，正好是「回答开头就在那儿」的观感。
+ *
+ * ⚠️ 这个数是**目标值**，实现上并不能直接给 `scrollOffset` —— 语义见下面 effect
+ * 里那段推导（`scrollToItem` 是把**中心**对到视口中心，不是把上沿对到某处）。
+ */
+private val CHAT_REPLY_TOP = 68.dp
+
+/**
+ * 2.382 多气泡的几何常量（**统一在这里调，别散落在各个调用点**）。
+ *
+ * ⚠️ **上下内边距是刻意不对称的。**
+ * 在模拟器（480×480 / 340dpi）上对截图做像素量测：同一颗气泡里，
+ * 文字墨迹到气泡上沿 11.8dp、到下沿 10.4dp —— 字体本身的 ascent 比 descent 大，
+ * 内边距给成一样的 7/7 时，**肉眼看到的就是「文字偏下、下边挤」**。
+ * 所以上收 1dp、下加 1dp（6 / 8），实测两边的**视觉间距相等**（±0.5dp 内）。
+ * 改字号 / 换字体后要重新截图量一次，别沿用。
+ *
+ * 其余三个数一起看：
+ *  * 段间距 [BUBBLE_GAP] 必须明显大于内边距的一半，否则相邻两颗气泡看起来像一张卡被切开；
+ *  * 名字行与第一颗气泡之间留 [BUBBLE_LABEL_GAP]，不要用 Card 的内边距兼职。
+ */
+private val BUBBLE_GAP = 6.dp
+private val BUBBLE_PAD_H = 12.dp
+private val BUBBLE_PAD_TOP = 6.dp
+private val BUBBLE_PAD_BOTTOM = 8.dp
+private val BUBBLE_LABEL_START = 4.dp
+private val BUBBLE_LABEL_GAP = 4.dp
+
+
+
 @Composable
 fun ChatScreen(
     conversationId: String,
@@ -122,8 +176,8 @@ fun ChatScreen(
      *
      * [draft] 是带过去待改的初始文字（语音识别结果，无则空串）。
      * [rewriteIndex] 非 null 表示这次是「编辑重发」：改完发送时要作废第 index 条
-     * 用户消息及其之后的全部内容（见 ChatEngine.rewrite）。注意只有**最新那一问**
-     * 会被传进来 —— 更早的提问不给长按，判据在本文件下面那段注释里。
+     * 用户消息及其之后的全部内容（见 ChatEngine.rewrite）。2.1 起**任意一条**用户
+     * 消息都能进这里 —— 后果警告（后面会删掉几条）在 ChatScreen 的弹窗里先给过。
      */
     onOpenTextInput: (draft: String, rewriteIndex: Int?) -> Unit,
     onOpenSettings: () -> Unit,
@@ -151,6 +205,10 @@ fun ChatScreen(
         ?.let { ChatEngine.findPersona(it)?.name }
         ?.takeIf { it.isNotBlank() }
         ?: "DeepSeek"
+
+    // 2.383：多气泡只给角色会话。Ask 是「一问一答」，显示保持 2.35 的原样
+    //（一张卡 + 「DeepSeek」标签），见 MessageCard 的 `personaChat`。
+    val personaChat = conversation?.personaId != null
 
     /**
      * 会话真的被删掉时，**自己退回上一页**，不停在这块空屏上。
@@ -193,14 +251,95 @@ fun ChatScreen(
         }
     }
     var hint by remember { mutableStateOf<String?>(null) }
-    /** 用户长按了最后一条提问，正在问他要不要改了重发。值是那条消息的下标。 */
+
+    // ---------------------------------------------------- 主动消息（2.35）
+    //
+    // **只在进入会话时调一次**：key 用 `conversationId`，同一页重组不会重复触发。
+    // 从输入页 / 设置页返回也算「重新进入」—— 这正是想要的（那时可能已经隔了很久）。
+    //
+    // ⚠️ 不要把这里的 key 换成 `messages.size` 或 `conversation`：
+    //  * 用 messages.size：她插完 3 条会把 size 推大，effect 重跑，再插一次 → 刷屏；
+    //  * 用 conversation：流式时每个 token 都换新实例，等于每片都重跑一次。
+    //
+    // 判定（隔了多久 / 几点 / 今天第几次）全在 ChatEngine.onChatOpened 里，
+    // 这一行只负责说「打开了」。
+    LaunchedEffect(conversationId) {
+        ChatEngine.onChatOpened(conversationId)
+    }
+
+    /** 用户长按了某条提问、警告确认后要改的，值是那条消息的下标。 */
     var pendingRewrite by remember { mutableStateOf<Int?>(null) }
+
+    /**
+     * 长按唤出的消息菜单：值为被长按那条消息的**下标**（不记 message 对象 ——
+     * 列表 item 的 key 是 `"m$index-${timestamp}"`，用下标才能和列表对上）。
+     * 2.1 重做：所有用户消息和助手消息都能长按唤菜单，不再直接执行动作。
+     */
+    var menuFor by remember { mutableStateOf<Int?>(null) }
+
+    /**
+     * 「重新生成」的警告确认状态：值为待重新生成那条助手消息的下标。
+     * 只有「后面还有内容」的情形才弹警告（后面什么都没有时直接执行，不弹）。
+     */
+    var pendingRegenerate by remember { mutableStateOf<Int?>(null) }
+
+    /**
+     * 「删除此信息」的警告确认状态：值恒为最后一条用户消息的下标。
+     */
+    var pendingDeleteExchange by remember { mutableStateOf<Int?>(null) }
+
+    // ⚠️ 流式一开始就自动关掉菜单/警告弹窗：菜单挂在某个下标上，而流式期间
+    // 列表内容还在变（那个下标指向的消息随时可能被替换或消失），
+    // 菜单开着等于悬在一个正在变的列表上。
+    LaunchedEffect(streaming) {
+        if (streaming) {
+            menuFor = null
+            pendingRegenerate = null
+            pendingDeleteExchange = null
+        }
+    }
+
+    /**
+     * 复制成功后的短暂反馈。
+     *
+     * ⚠️ **刻意不复用列表里的 `hint`**：那个提示自带一个「出现就滚到底」的 effect，
+     * 复制完把用户从正在读的地方拽走，比不给反馈还糟。所以复制反馈做成**覆盖层**，
+     * 不进列表、不碰滚动位置。
+     *
+     * ⚠️ **2.1 重做观感**（用户对旧版的原话：「它做的复制文本功能就很垃」）：
+     * 旧版是一张居中的 `secondaryContainer` 卡片，糊在屏幕正中 —— 菜单刚关、
+     * 视线还在那条消息上，突然中间糊上一块卡片，还盖住了正在读的内容。
+     * 新版改成**顶部时间胶囊下方的一行小字**（覆盖层，不进列表）：
+     * 不遮挡正文、不移动列表、颜色压暗不抢眼。
+     *
+     * 手表没有系统级的剪贴板提示（Toast 在 Wear 上时灵时不灵），只能自己说一声。
+     */
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            // 2.2：时长改用两处共用的 `TransientLabelHoldMs`（原来是本页写死的 1400）。
+            // ⚠️ 别再写回字面量 —— 「已复制」和模式提示的停留长短必须同源。
+            delay(TransientLabelHoldMs)
+            copied = false
+        }
+    }
+    val context = LocalContext.current
+
+    /** 把一条消息的正文写进剪贴板。只拿 `content`，不带思维链（思维链是模型的草稿，不是回答）。 */
+    fun copyMessage(body: String) {
+        val manager = context.getSystemService(ClipboardManager::class.java) ?: return
+        manager.setPrimaryClip(ClipData.newPlainText("WhaleChat", body))
+        copied = true
+    }
     // 引擎侧的提示（「上一条还在回答，先等它说完」「请先填 API Key」）以前只在首页显示，
     // 可触发它们的动作恰恰都发生在聊天页（语音、文字输入页发出的消息），
     // 结果就是用户点了发送却看不到任何反馈 —— 这里也订阅一份。
     val engineNotice by ChatEngine.notice.collectAsStateWithLifecycle()
 
     val listState = rememberScalingLazyListState()
+
+    /** 进页定位要按像素算落点（[CHAT_REPLY_TOP] 是 dp，`scrollOffset` 是 px）。 */
+    val density = LocalDensity.current
 
     /**
      * 是否让视图自动钉在最后一条。
@@ -267,17 +406,56 @@ fun ChatScreen(
         val lastAssistant = messages.indexOfLast { it.role == ChatRole.ASSISTANT }
         if (lastAssistant >= 0) {
             // 消息 items 前面还有 1 个 top_gap ⇒ 列表索引 = 消息下标 + 1。
-            // ⚠️ scrollOffset 的真实语义（1.993 两轮实测校准，别凭文档猜）：
-            //  * 文档说 positive = item 更靠上，但**实测**：+140 把回答滚到顶满全屏
-            //    （角色名被时间胶囊盖住），-140 让回答落在 y≈236（屏高 49%）。
-            //    实测语义与文档相反（或「中心对位 + 偏移」的合成方向如此）。
-            //  * 目标：角色名（卡顶）在屏高 ~27%（y≈130）⇒ 从 -140 的 49% 再上抬
-            //    ~106px ⇒ **offset = -40**。
-            //  * 换 offset 前先真机量一下，两个方向的教训都在上面。
-            listState.scrollToItem(
-                index = lastAssistant + 1,
-                scrollOffset = -40,
-            )
+            //
+            // ## ⚠️⚠️ 2.2：为什么不能只给一个 `scrollOffset`
+            //
+            // `ScalingLazyListState.scrollToItem` 的**真实语义**（1.5.6 源码
+            // `ScalingLazyListState.kt:499-519`，默认 `anchorType = ItemCenter`）：
+            //
+            // ```
+            // offset = (beforeContentPadding − 视口中心线) + item.size / 2 + scrollOffset
+            // ```
+            //
+            // 即「把这一项的**中心**放到视口中心，再按 scrollOffset 继续偏移」。
+            // 而一条长回答比视口高得多（实测 2000px 左右）⇒ 中心对位只能让它**中段**入屏：
+            // 这就是用户截图里「一进来看到的是回答中段、开头被切掉」的根因。
+            //
+            // 2.1 用 `-40` 想把它再往上抬一点，实际是在「中段」基础上再微调 40px ——
+            // 方向对、量级差两个数量级，所以怎么调都是「看到中段」。
+            //
+            // ## 现在的做法（两步，先量再定位）
+            //
+            //  1. 先 `scrollToItem(index, 0)` —— 让目标项进视口并**被测量**；
+            //  2. 从 `layoutInfo` 读出它自己的高度，反算出「让它的**上沿**落在
+            //     [CHAT_REPLY_TOP] 处」需要的偏移量，再 `scrollToItem` 一次。
+            //
+            // 偏移量推导：中心对位时上沿在 `视口中心 − size/2`；要把它挪到 `target`，
+            // 需要把这一项**往下**挪 `(视口中心 − size/2) − target`，
+            // 而 scrollOffset 越大项越靠上 ⇒ `scrollOffset = 视口中心 − size/2 − target`。
+            // 实测（480px 屏、长回答）：`size ≈ 2050` ⇒ offset ≈ −825，落点顶沿
+            // y≈140px，见报告里的 dump/像素数字。
+            //
+            // ⚠️ 用 `unadjustedSize`（缩放前的布局高度）而不是 `size`（缩放后）：
+            // 中心对位的公式里本身就是 `item.size`，但缩放会随位置变化 ——
+            // 一轮即可（实测误差 < 2px），别写成循环去追，那会在流式期间反复抖动。
+            val targetIndex = lastAssistant + 1
+            listState.scrollToItem(index = targetIndex, scrollOffset = 0)
+            // ⚠️ **必须等布局把这一项测出来再读 `layoutInfo`**：实测 `scrollToItem` 返回时
+            // `visibleItemsInfo` 还是**空列表**（`withFrameNanos` 一次也不够），
+            // 此时 `firstOrNull { … }` 拿到 null，后面那次定位就整个被跳过 ——
+            // 症状是「改了 offset 但画面一点没变」，极易误判成 offset 值不对。
+            // 所以用 snapshotFlow 等它出现，并加 1s 兜底：绝不允许这个 effect 无限挂起。
+            val info = withTimeoutOrNull(1_000L) {
+                snapshotFlow {
+                    listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
+                }.filterNotNull().first()
+            }
+            if (info != null) {
+                val viewport = listState.layoutInfo.viewportSize.height
+                val target = with(density) { CHAT_REPLY_TOP.toPx() }
+                val offset = (viewport / 2f - info.size / 2f - target).roundToInt()
+                listState.scrollToItem(index = targetIndex, scrollOffset = offset)
+            }
         } else {
             listState.scrollToItem(count - 1)
         }
@@ -378,6 +556,9 @@ fun ChatScreen(
     // 不挂它，按钮会把落在它身上的触摸整个吃掉、和列表的滚动状态对不上，
     // 于是 `ScreenScaffold` 的高度在 `snapTo / animateTo` 两个分支之间来回切。
     // 现在五处贴边按钮统一挂 `Modifier.edgeButtonScrollable(listState)`（见它的 KDoc）。
+    // 外面这层 Box 只为「已复制」那个覆盖层服务 —— 它必须浮在列表**之上**，
+    // 又不许进列表（进了列表就要跟着滚动，还会被 LazyColumn 的高度算进去）。
+    Box(modifier = Modifier.fillMaxSize()) {
     ScreenScaffold(
         scrollState = listState,
         edgeButtonSpacing = BackEdgeButtonSpacing,
@@ -427,26 +608,34 @@ fun ChatScreen(
                 }
             }
 
-            // **只有「最新那条提问」能长按改。**
+            // **2.1：长按只负责唤出菜单，不再直接执行动作。**
             //
-            // 判据是「它后面再没有别的用户消息」，而不是「它是列表的最后一项」：
-            // 最新那一问后面通常还挂着一条回答 —— 那正是要重答的对象；出错时还可能
-            // 挂着一张错误卡。这些都不影响「它是最新的一问」这个身份。
-            //
-            // 为什么不给更早的那些：改中间那句的后果是把它**后面已经发生的整段对话**
-            // 一起作废。会话滚长之后回头改前面某句，代价是后面几轮问答全部消失 ——
-            // 规则是「不允许在已有多条对话时，去编辑以前的消息……
-            // 不能出现为了编辑之前的消息然后舍弃下面更新的对话」。
-            //
-            // 两处仍然不给长按：
-            //  * 助手消息 —— 改回答没有意义，回答是模型的产物，只能重问；
-            //  * 正在生成时 —— 后面的回答还没定型，改了说不清要作废什么。
-            val lastUserIndex = messages.indexOfLast { it.role == ChatRole.USER }
+            // 旧版只有「最新一条提问」能长按（直接弹编辑警告）、其余消息长按直接复制 ——
+            // 用户 2026-10-24 推翻了这套：「两模式所有对话对话页都可以长按唤出新菜单，
+            // 旧菜单删除重做」。现在的规则：
+            //  * 用户消息、助手消息**都能长按** → 唤出消息菜单（按角色给不同动作）；
+            //  * 流式期间一律不给（内容还在变，复制到的会是半截、菜单也会悬在变动的列表上）；
+            //  * 错误卡不给（它有自己的「重试」按钮）；
+            //  * 空/空白内容不给（没得复制也没得编辑）。
             messages.forEachIndexed { index, message ->
                 item(key = "m$index-${message.timestamp}") {
+                    // 长按要震一下（2.2 §1.5：Wear 上没触感＝用户以为没点上）。
+                    // 同一个 lambda 给两种角色复用，语义都是「唤出这条消息的菜单」。
+                    val openMenu = rememberLongPressHaptic { menuFor = index }
+                    val longAction: (() -> Unit)? = when {
+                        streaming -> null
+                        message.error -> null
+                        message.role == ChatRole.USER && message.content.isNotBlank() -> openMenu
+
+                        message.role == ChatRole.ASSISTANT && message.content.isNotBlank() -> openMenu
+
+                        else -> null
+                    }
                     MessageCard(
                         message = message,
                         assistantLabel = assistantLabel,
+                        // 2.383：只有角色会话拆气泡；Ask 保持原样（见 MessageCard 的注释）。
+                        personaChat = personaChat,
                         // 气泡右上角那个时间显不显示，由设置里那个开关决定。
                         // **由调用方传进来**（这一层已经订阅过 settings 了），
                         // 不在 MessageCard 内部再订阅一次 —— 每条消息各订阅一次状态，
@@ -457,11 +646,10 @@ fun ChatScreen(
                         } else {
                             null
                         },
-                        onLongClick = if (index == lastUserIndex && !streaming) {
-                            { pendingRewrite = index }
-                        } else {
-                            null
-                        },
+                        onLongClick = longAction,
+                        // 读屏会念出来。现在所有可长按的消息都是「唤出菜单」，
+                        // 不再按角色写死成「编辑重发 / 复制」两种。
+                        onLongClickLabel = "消息操作",
                     )
                 }
             }
@@ -697,21 +885,103 @@ fun ChatScreen(
         }
     }
 
-    // 长按最新那条提问 → 全屏确认要不要改。原文一并摆出来：用户得先看清自己要改的是哪句
-    // （弹窗是全屏的，背后那条气泡会被盖住）。
+        // 复制反馈（2.1 重做，2.2 统一）：**一行小字浮在屏幕上部**，不再是糊在正中的卡片。
+        // 设计依据见上面 `copied` 的注释 —— 不遮挡正文、不移动列表、不进列表
+        // （进列表会触发「出现就滚到底」的 effect）。
+        //
+        // ⚠️⚠️ 2.2：这里原来是本页自己写的 `if (copied) Text(...)`（labelSmall /
+        // onSurfaceVariant×0.85 / top=30dp / **没有动画** / 1.4s），而首页把模式提示
+        // 写成了另一份（labelMedium / 不透明 / top=17.5dp / 有 fade / 2s）。
+        // 用户原话「复制文本后的『已复制』提示显示和切换模式的提示文本显示效果统一」
+        // ⇒ 两处改用同一个 `TransientLabel`；字号/颜色/落点/动画/时长都在组件里，
+        // **本页不再出现第二份样式**。时长由调用方计时（组件保持无状态），
+        // 用的是两处共用的 `TransientLabelHoldMs`（2 秒，原来是 1.4 秒）。
+        TransientLabel(
+            text = "已复制",
+            visible = copied,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = TransientLabelTop),
+        )
+    }
+
+    // ── 消息菜单（2.1 重做）──────────────────────────────────────────────
     //
-    // 能长按到的只有「最新一问」，所以后果只剩两种：它已经是最后一条（下面什么都没有），
-    // 或者它下面挂着一条回答（少数情况下是一张失败卡）。不再有「下面还有 N 轮追问会一起
-    // 删掉」那种量级 —— 那种编辑已经被上面的判据挡在门外了。
+    // ⚠️ 从菜单项触发动作前**必须重新取一次** `messages.getOrNull(index)`：
+    // 菜单开着时列表可能变（比如流式刚结束、列表重建），下标可能已经指向别的消息
+    // 或干脆越界 —— 取不到就静默关掉菜单，绝不能拿旧引用动作，更不能崩。
+    menuFor?.let { index ->
+        val message = messages.getOrNull(index)
+        if (message == null || message.error || message.content.isBlank()) {
+            // 目标已经不在/不可操作了，安静收场。
+            menuFor = null
+        } else {
+            val isUser = message.role == ChatRole.USER
+            // 「删除此信息」只出现在最后一条用户消息上。非最后一条：这一项**干脆不出现**
+            // （而不是变灰）—— Wear 上三项已经很挤，多一项灰的既占位置又要额外解释
+            // 「为什么不能点」。
+            val isLastUser = index == messages.indexOfLast { it.role == ChatRole.USER }
+            WhaleChatMenuDialog(
+                title = if (isUser) "你的消息" else assistantLabel,
+                onDismiss = { menuFor = null },
+                actions = buildList {
+                    if (isUser) {
+                        add(
+                            // 键盘图标：编辑重发的动作终点是文字输入页。
+                            DialogAction("编辑重发", icon = AppIcons.Keyboard) {
+                                menuFor = null
+                                pendingRewrite = index
+                            },
+                        )
+                    } else {
+                        add(
+                            // 星形（Sparkle）：和「生成」相关的动作在别处也用它，
+                            // 重新生成是同一族的语义。
+                            DialogAction("重新生成", icon = AppIcons.Sparkle) {
+                                menuFor = null
+                                // 后面还有内容 ⇒ 必须先警告（后果和「编辑重发中间那句」
+                                // 完全一样）；就是最后一条 ⇒ 直接重答，不弹窗打扰。
+                                if (messages.size - index - 1 > 0) {
+                                    pendingRegenerate = index
+                                } else {
+                                    ChatEngine.regenerate(conversationId, index)
+                                }
+                            },
+                        )
+                    }
+                    add(
+                        // 气泡：复制的是一段话，用对话气泡比抽象的「复制」符号好认
+                        // （AppIcons 没有现成的 copy 图标，宁可用贴切的、不硬凑）。
+                        DialogAction("复制文本", icon = AppIcons.Bubble) {
+                            menuFor = null
+                            copyMessage(message.content)
+                        },
+                    )
+                    if (isUser && isLastUser) {
+                        add(
+                            DialogAction("删除此信息", destructive = true, icon = AppIcons.Delete) {
+                                menuFor = null
+                                pendingDeleteExchange = index
+                            },
+                        )
+                    }
+                },
+            )
+        }
+    }
+
+    // ── 编辑重发警告 ────────────────────────────────────────────────────
+    // 原文一并摆出来：用户得先看清自己要改的是哪句（弹窗是全屏的，背后那条气泡会被盖住）。
+    // N = 那条消息后面还有几条（真实条数，不许写成模糊的「后面的内容」）。
     pendingRewrite?.let { index ->
         val original = messages.getOrNull(index)?.content.orEmpty()
         val dropped = messages.size - index - 1
         WhaleChatDialog(
             title = "改一下这句？",
             body = if (dropped == 0) {
-                "改完发送，就用新的问法重问一遍。"
+                "改完发送，就用新的问法重新答一遍。"
             } else {
-                "改完发送，原来那条回复会被删掉再重新答一遍。"
+                "改完发送，后面 $dropped 条内容会一起删掉，再重新答。"
             },
             confirmLabel = "编辑",
             quote = original,
@@ -720,6 +990,43 @@ fun ChatScreen(
                 onOpenTextInput(original, index)
             },
             onDismiss = { pendingRewrite = null },
+        )
+    }
+
+    // ── 重新生成警告（只弹「后面还有内容」的情形）────────────────────────
+    pendingRegenerate?.let { index ->
+        // 弹窗出现到用户点确认之间列表可能又变了，重新取一次真实条数。
+        val dropped = messages.size - index - 1
+        if (dropped <= 0) {
+            // 后面已经没有内容了（比如那条回答又被截断了），直接执行，不必警告。
+            pendingRegenerate = null
+            ChatEngine.regenerate(conversationId, index)
+        } else {
+            WhaleChatDialog(
+                title = "重新生成这条？",
+                body = "后面 $dropped 条内容会一起删掉，再重新答这条。",
+                confirmLabel = "重新生成",
+                onConfirm = {
+                    pendingRegenerate = null
+                    ChatEngine.regenerate(conversationId, index)
+                },
+                onDismiss = { pendingRegenerate = null },
+            )
+        }
+    }
+
+    // ── 删除此信息警告 ──────────────────────────────────────────────────
+    pendingDeleteExchange?.let {
+        WhaleChatDialog(
+            title = "删掉这条？",
+            body = "这条提问和它的回答都会从记录里删掉，无法恢复。",
+            confirmLabel = "删除",
+            destructive = true,
+            onConfirm = {
+                pendingDeleteExchange = null
+                ChatEngine.deleteLastUserExchange(conversationId)
+            },
+            onDismiss = { pendingDeleteExchange = null },
         )
     }
 }
@@ -754,10 +1061,21 @@ private fun MessageCard(
     message: ChatMessage,
     /** 助手气泡顶上那一行写谁说的：角色会话是角色名，普通会话是「DeepSeek」。 */
     assistantLabel: String,
+    /**
+     * 这条会话是不是**角色会话**（`Conversation.personaId != null`）。
+     *
+     * ⚠️ 2.383：多气泡**只对角色会话生效**。
+     * Ask（一次性问答）的回复仍然走原来那张单卡 —— 它是「一问一答」，
+     * 拆成一句一个气泡既没有「她在发消息」的语境，也违背「不动 Ask」这条红线。
+     * 判据由调用方从 `conversation.personaId` 算好传进来，**不要**在这里读引擎状态。
+     */
+    personaChat: Boolean,
     /** 气泡右上角那个时间显不显示（`Settings.showBubbleTime`）。 */
     showBubbleTime: Boolean,
     onRetry: (() -> Unit)?,
     onLongClick: (() -> Unit)?,
+    /** 长按的动作说明（「编辑重发」/「复制」）。无障碍读屏会念出来。 */
+    onLongClickLabel: String,
 ) {
     val scheme = MaterialTheme.colorScheme
     val isUser = message.role == ChatRole.USER
@@ -784,13 +1102,49 @@ private fun MessageCard(
     var reasoningOpen by remember { mutableStateOf(false) }
     val hasReasoning = message.reasoning.isNotBlank()
 
+    val body = message.content.ifBlank { if (message.error) "出错了" else "…" }
+
+    // ------------------------------------------------------- 2.382 多气泡（修好版）
+    //
+    // 2.36 的多气泡有两个硬伤（用户 2026-11-01 反馈）：
+    //  1. **文字上下间距不一致**：名字行塞在第一个气泡里，首泡比后续高；
+    //     短句又被 Card 的最小高度撑成大空泡；
+    //  2. **视觉不协调**：每段都是全宽卡，段间距 5dp 小于卡片内边距，像一张卡被切开。
+    //
+    // 2.382 的修法（三件事一起做，缺一不可）：
+    //  * **名字移到整组气泡上方**（不进任何气泡）⇒ 每个气泡结构完全一致；
+    //  * 气泡用 `Box + clip + background + 显式 padding`，**不用 Card** ——
+    //    Card 的最小高度会把短句撑开，而这里短句就该是一个小药丸；
+    //  * 气泡**按内容收缩**（不 `fillMaxWidth`），段间距 6dp > 内边距的视觉厚度。
+    //
+    // 用户消息与错误消息仍然走下面那张 Card：它们是「一次发言」/系统提示，
+    // 不该被拆，也不该改成小气泡。
+    // ⚠️ 2.383：**Ask 会话也不拆**（`personaChat == false`）—— Ask 是「一问一答」，
+    //    保持原来那张带「DeepSeek」标签的单卡；多气泡只属角色会话。
+    if (!isUser && !message.error && personaChat) {
+        AssistantBubbles(
+            label = assistantLabel,
+            reasoning = message.reasoning,
+            reasoningOpen = reasoningOpen,
+            onToggleReasoning = { reasoningOpen = !reasoningOpen },
+            parts = remember(body) { splitForBubbles(body) },
+            bubbleColor = container,
+            textColor = content,
+            labelColor = labelColor,
+            onLongClick = onLongClick,
+            onLongClickLabel = onLongClickLabel,
+            onRetry = onRetry,
+        )
+        return
+    }
+
     Card(
         onClick = { if (hasReasoning) reasoningOpen = !reasoningOpen },
         modifier = Modifier.fillMaxWidth(),
-        // 长按只挂在用户消息上（见上面的循环）。传 null 时卡片行为和以前完全一样，
+        // 长按只挂在能干的活上（见上面的循环）。传 null 时卡片行为和以前完全一样，
         // 不会多出一个点不出东西的长按手势。
         onLongClick = onLongClick,
-        onLongClickLabel = if (onLongClick != null) "编辑重发" else null,
+        onLongClickLabel = if (onLongClick != null) onLongClickLabel else null,
         colors = CardDefaults.cardColors(containerColor = container, contentColor = content),
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
@@ -845,15 +1199,122 @@ private fun MessageCard(
                 )
             }
 
-            val body = message.content.ifBlank { if (message.error) "出错了" else "…" }
+            // 2.31：模型回复里的 Markdown / LaTeX 在手表上没法直接读
+            // （`\(\mathrm{S}^{2-} + 4H_2O \rightarrow …\)` 会原样显示成一堆反斜杠和大括号）。
+            // 只在**显示**时收成纯文本；用户自己的消息不动，消息原文 / 复制 / 上下文也不动。
+            val shown = if (isUser) body else remember(body) { formatForWatch(body) }
             Text(
-                text = body,
+                text = shown,
                 style = MaterialTheme.typography.bodyMedium,
             )
 
             if (onRetry != null) {
                 TextButton(onClick = onRetry) { Text("重试") }
             }
+        }
+    }
+}
+
+/**
+ * 助手消息的「多气泡」渲染（2.382 修好版）。
+ *
+ * ```
+ * 贴吧老哥                     ← 名字只出现一次，在气泡组外面
+ * ┌──────────┐
+ * │ 又是你    │               ← 每个气泡：同一个 shape/颜色/padding
+ * └──────────┘
+ * ┌──────────┐
+ * │ 说        │               ← 短句按内容收缩，不再拉满全宽
+ * └──────────┘
+ * ```
+ *
+ * ## 为什么不用 `Card`
+ *
+ * Wear M3 的 `Card` 带最小高度与默认内边距，短句（「说」「嗯」）会被撑成一个大空泡 ——
+ * 这正是用户说的「字体上下间距不一致」。这里直接用 `Box + clip + background`，
+ * 内边距由 [BUBBLE_PAD_H] / [BUBBLE_PAD_V] 明确给定，所有气泡完全一致。
+ *
+ * ## 交互
+ *
+ *  * 长按任意一颗气泡 = 复制**整条消息**（`onLongClick` 由调用方按整条内容实现）；
+ *  * 点击第一颗气泡 = 展开/收起思维链（思维链挂在名字下面，不占气泡）；
+ *  * 气泡**不 fillMaxWidth**：短句就是一个小药丸，长句在可用宽度处自动换行。
+ *
+ * @param parts 已经按行切好的段（[splitForBubbles]），至少一段
+ */
+@Composable
+private fun AssistantBubbles(
+    label: String,
+    reasoning: String,
+    reasoningOpen: Boolean,
+    onToggleReasoning: () -> Unit,
+    parts: List<String>,
+    bubbleColor: Color,
+    textColor: Color,
+    labelColor: Color,
+    onLongClick: (() -> Unit)?,
+    onLongClickLabel: String,
+    onRetry: (() -> Unit)?,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = labelColor,
+            modifier = Modifier.padding(start = BUBBLE_LABEL_START),
+        )
+
+        if (reasoning.isNotBlank()) {
+            Text(
+                text = if (reasoningOpen) reasoning else "思考过程 · 点击展开",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = if (reasoningOpen) Int.MAX_VALUE else 1,
+                modifier = Modifier.padding(start = BUBBLE_LABEL_START, top = 2.dp),
+            )
+        }
+
+        Spacer(Modifier.height(BUBBLE_LABEL_GAP))
+
+        Column(verticalArrangement = Arrangement.spacedBy(BUBBLE_GAP)) {
+            parts.forEachIndexed { index, part ->
+                Box(
+                    modifier = Modifier
+                        // shape 用主题的 large：和项目里其它 M3E 容器是同一套圆角。
+                        .clip(MaterialTheme.shapes.large)
+                        .background(bubbleColor)
+                        // combinedClickable 而不是 Card 的 onClick/onLongClick：
+                        // Card 会强制最小尺寸，这里要「短句就是小药丸」。
+                        .combinedClickable(
+                            onLongClick = onLongClick,
+                            onLongClickLabel = if (onLongClick != null) onLongClickLabel else null,
+                            // 只有第一颗挂思维链展开；没有思维链时点击等于空操作
+                            // （和 2.35 单气泡的 Card 行为一致，不会多出一个可点的语义）。
+                            onClick = { if (index == 0) onToggleReasoning() },
+                        )
+                        .padding(
+                            start = BUBBLE_PAD_H,
+                            end = BUBBLE_PAD_H,
+                            // 上下**不等**：抵消字体 ink 偏下（见 [BUBBLE_PAD_TOP] 的测量注释）。
+                            top = BUBBLE_PAD_TOP,
+                            bottom = BUBBLE_PAD_BOTTOM,
+                        ),
+                ) {
+                    Text(
+                        // 2.31 的显示层清洗：先按行拆（splitForBubbles），再逐段格式化。
+                        // 顺序不能反 —— 先格式化会把换行/记号吃掉。
+                        text = remember(part) { formatForWatch(part) },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = textColor,
+                    )
+                }
+            }
+        }
+
+        if (onRetry != null) {
+            TextButton(onClick = onRetry) { Text("重试") }
         }
     }
 }

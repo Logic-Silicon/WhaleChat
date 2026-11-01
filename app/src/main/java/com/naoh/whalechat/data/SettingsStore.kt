@@ -221,6 +221,21 @@ data class Settings(
 
     /** Chat（角色会话）是否联网搜索。理由与默认值见 [searchAsk]。 */
     val searchChat: Boolean = false,
+
+    /**
+     * 「她会主动开口」（2.35）：打开角色会话时，隔得久了让她先说一句。
+     *
+     * ⚠️ **默认开**：这是这一版的主打观感，默认关等于没人看得见它。
+     * 但它**每一条都受 `ProactivePolicy` 的六道闸约束**（时段 / 间隔 / 每日上限），
+     * 不是「每次打开都说话」。
+     *
+     * ⚠️ 关掉时**只影响以后的插入**：不删历史、不清计数、不动 `proactive_last_*`。
+     * 再打开也不会立刻补一句 —— 那段时间的间隔本来就已经过去了。
+     *
+     * ⚠️ 这是一个**新字段**，所以没有 `display_defaults_xxxx` 那类一次性标记位：
+     * 老用户盘上没有这个键，读出来就是默认值 true，符合预期（不存在「被静默翻转」）。
+     */
+    val proactiveEnabled: Boolean = true,
 ) {
     /**
      * 当前的语音识别配置能不能直接用。
@@ -251,10 +266,41 @@ data class Settings(
 
     companion object {
         /**
-         * 手表屏幕就这么点大，默认让模型收着点说。
-         * 这条可以在设置里改或清空。
+         * ask 模式的默认系统提示词。
+         *
+         * ⚠️ **2.1 重写**。旧版是「你在智能手表上回答用户，屏幕很小……
+         * 除非用户明确要求，不要输出长代码块和长篇列表」（全文见
+         * [LEGACY_DEFAULT_SYSTEM_PROMPT_20]）。
+         * 用户原话：「以前提示词导致模型回答总被『小屏幕』条件限制，且不够贴近用户要求」。
+         *
+         * ⇒ 问题不在「简洁」，在**把它写成了设备约束**：模型据此主动省略步骤、
+         * 不给代码、不展开理由，而用户要的是把问题解决掉。
+         * 新版把「简洁」降级成**默认倾向**，把「解决问题」提成**第一目标**，
+         * 并且明确禁止「无关的铺垫/客套」—— 那才是真正该被砍掉的东西。
+         * 全文不再出现任何「屏幕很小」「设备限制」这类把设备当约束的说法。
+         *
+         * ⚠️ 这条只管 ask（一次性问答）。chat 那套走 `persona.buildCorePrompt() + CHAT_OUTPUT_RULES`，
+         * **不读这里**。
+         *
+         * ⚠️ 改这条**必须同步看 [LEGACY_DEFAULT_SYSTEM_PROMPT_20] 和
+         * [SettingsStore.applyPromptDefaults]**：老设备盘上存的是旧默认值的全文
+         * （`write()` 是全量写），光改常量覆盖安装的用户一个字都不会变。
          */
         const val DEFAULT_SYSTEM_PROMPT =
+            "你是一个可靠、直接的中文助手。回答以把问题解决掉为目标：" +
+                "先给结论，再按需要给理由、步骤或代码。默认简洁，" +
+                "但不要为了短而省掉关键信息 —— 用户要细节、要代码、要展开时就完整给出。" +
+                "不要写与问题无关的铺垫、客套和「希望这对你有帮助」这类收尾。"
+
+        /**
+         * 2.0 及更早版本的 [DEFAULT_SYSTEM_PROMPT] 原文，**逐字保留**。
+         *
+         * 它只被 [SettingsStore.applyPromptDefaults] 用于迁移判据：
+         * 盘上存的值与它**完全一致**（trim 后比较）才替换成新默认值 ——
+         * 那是「用户从没改过」的可靠判据。用户改过的、主动清空的都不许动。
+         * ⚠️ 别拿它去回答任何别的问题，也别改它的内容（改了迁移判据就失真）。
+         */
+        const val LEGACY_DEFAULT_SYSTEM_PROMPT_20 =
             "你在智能手表上回答用户，屏幕很小。回答力求简短直接，优先给结论；" +
                 "除非用户明确要求，不要输出长代码块和长篇列表。"
 
@@ -278,7 +324,10 @@ data class Settings(
 class SettingsStore(context: Context) {
 
     private val prefs = context.getSharedPreferences("whalechat_settings", Context.MODE_PRIVATE)
-        .also { applyDisplayDefaults(it) }
+        .also {
+            applyDisplayDefaults(it)
+            applyPromptDefaults(it)
+        }
 
     private val _state = MutableStateFlow(read())
     val state: StateFlow<Settings> = _state.asStateFlow()
@@ -344,6 +393,36 @@ class SettingsStore(context: Context) {
                 .putBoolean(KEY_DISPLAY_DEFAULTS_1979, true)
                 .apply()
         }
+    }
+
+    /**
+     * ask 默认提示词的一次性迁移（2.1）。
+     *
+     * ⚠️ **为什么必须迁移**：[write] 是全量写，`system_prompt` 每次保存设置都会落盘
+     * ⇒ 老设备盘上存的是 2.0 旧默认值的**全文**，[read] 读到的是盘里的值，
+     * 光改 [Settings.DEFAULT_SYSTEM_PROMPT] 常量，覆盖安装的用户一个字都不会变。
+     *
+     * 判据：**只有盘上的值和 [Settings.LEGACY_DEFAULT_SYSTEM_PROMPT_20] 完全一致**
+     * （trim 后比较）才替换 —— 那是「用户从没改过」的可靠判据。
+     * 四种情况的边界：
+     *  * 盘上没有这个键 → 什么都不用做（[read] 会取新默认值），**仍要写标记位**；
+     *  * 盘上的值 == 旧默认值 → 替换成新默认值；
+     *  * 盘上的值是用户改过的 → **一个字都不动**，只写标记位；
+     *  * 盘上的值是**空串**（用户主动清空）→ **不许动**！
+     *    ⚠️ 所以判据是 `==` 旧默认值，**绝不能写成 isBlank() 之类** ——
+     *    那会把用户主动清空的又填回去。
+     *
+     * ⚠️ 标记位**最后写**，且**只在 defaults 函数里写、绝不能进 [write]** ——
+     * 否则每次保存设置都会重跑迁移、把用户改过的值冲掉。
+     * 与 [applyDisplayDefaults] 同一条硬约束。
+     */
+    private fun applyPromptDefaults(target: SharedPreferences) {
+        if (target.getBoolean(KEY_PROMPT_DEFAULTS_21, false)) return
+        val current = target.getString(KEY_PROMPT, null)
+        if (current != null && current.trim() == Settings.LEGACY_DEFAULT_SYSTEM_PROMPT_20.trim()) {
+            target.edit().putString(KEY_PROMPT, Settings.DEFAULT_SYSTEM_PROMPT).apply()
+        }
+        target.edit().putBoolean(KEY_PROMPT_DEFAULTS_21, true).apply()
     }
 
     /**
@@ -428,6 +507,9 @@ class SettingsStore(context: Context) {
 
     fun setSearchChat(value: Boolean) = write { it.copy(searchChat = value) }
 
+    // ---- 主动消息开关（2.35）。和联网搜索同一套写法：一个字段、一个键、一个 setter ----
+    fun setProactiveEnabled(value: Boolean) = write { it.copy(proactiveEnabled = value) }
+
     /**
      * 手机扫码保存：把网页上那一屏**原样**存进来。
      *
@@ -503,6 +585,8 @@ class SettingsStore(context: Context) {
             // 和 mode_ask / mode_chat 同一套路 —— 改一个绝不动另一个。
             .putBoolean(KEY_SEARCH_ASK, next.searchAsk)
             .putBoolean(KEY_SEARCH_CHAT, next.searchChat)
+            // 主动消息开关（2.35）。**必须写**：只读不写 = 用户关掉后重启又自己打开。
+            .putBoolean(KEY_PROACTIVE_ENABLED, next.proactiveEnabled)
         if (sync) editor.commit() else editor.apply()
         _state.value = next
     }
@@ -566,6 +650,9 @@ class SettingsStore(context: Context) {
             // 与 `Settings` 里那两个字段的默认值一致。**不涉及默认值翻转，不需要标记位。**
             searchAsk = prefs.getBoolean(KEY_SEARCH_ASK, false),
             searchChat = prefs.getBoolean(KEY_SEARCH_CHAT, false),
+            // 主动消息（2.35）。盘上没有这个键（全新安装 / 从 2.34 及更早升上来）
+            // 就是默认值 true，与 [Settings.proactiveEnabled] 一致。
+            proactiveEnabled = prefs.getBoolean(KEY_PROACTIVE_ENABLED, true),
         )
     }
 
@@ -645,6 +732,15 @@ class SettingsStore(context: Context) {
         const val KEY_SEARCH_CHAT = "search_chat"
 
         /**
+         * 「她会主动开口」开关（2.35）。
+         *
+         * ⚠️ 和 [KEY_SEARCH_ASK] / [KEY_SEARCH_CHAT] 一样是**新字段的独立键**：
+         * 不要塞进别的布尔里复用，也不要和 chat 的联网搜索共用一个键
+         * （一个管「发请求前先搜一下」，一个管「不发请求也能说话」，两件事）。
+         */
+        const val KEY_PROACTIVE_ENABLED = "proactive_enabled"
+
+        /**
          * [applyDisplayDefaults] **第一次**覆盖的「已覆盖过」标记位
          * （那一版写的是：对话用量关 / 角色列表开 / 气泡时间开）。
          *
@@ -670,6 +766,16 @@ class SettingsStore(context: Context) {
          * 进去就等于用户每改一次设置都把「对话中的用量」重置回默认值。
          */
         const val KEY_DISPLAY_DEFAULTS_1979 = "display_defaults_1979"
+
+        /**
+         * [applyPromptDefaults] 的「已迁移」标记位（2.1 加的）：
+         * ask 默认系统提示词换新文案，老设备盘上等于旧默认值的替换成新的。
+         *
+         * ⚠️ 与 1911/1979 两个标记位同一条硬约束：**只在 [applyPromptDefaults]
+         * 里写、最后写，绝不能进 [write]** —— 进去就等于每次保存设置都重跑迁移，
+         * 把用户改过的提示词冲掉。
+         */
+        const val KEY_PROMPT_DEFAULTS_21 = "prompt_defaults_21"
 
         /**
          * 已废弃、不再读也不再写的键：`asr_enabled`（更早的布尔开关）、

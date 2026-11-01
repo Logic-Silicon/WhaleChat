@@ -1,10 +1,14 @@
 package com.naoh.whalechat.ui
 
-import android.provider.Settings
+import android.app.RemoteInput
+import android.content.Intent
+import android.os.Bundle
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,7 +20,6 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -26,14 +29,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material3.Card
 import androidx.wear.compose.material3.CardDefaults
 import androidx.wear.compose.material3.FilledIconButton
@@ -41,6 +46,7 @@ import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.MaterialTheme
 import androidx.wear.compose.material3.ScreenScaffold
+import androidx.wear.compose.material3.ScrollIndicator
 import androidx.wear.compose.material3.Text
 import androidx.wear.compose.material3.TextButton
 import com.naoh.whalechat.data.ChatEngine
@@ -81,12 +87,14 @@ sealed interface InputTarget {
      * 开着就先填字让你改，关掉就说完即发（见下方 rememberVoiceInput）。
      *
      * [draft] 是从对话页带过来的待改文字 —— 录音还没发出去时按了键盘按钮，
-     * 那句识别结果就落在这儿，用户接上键盘接着改。空串表示没有草稿
-     * （直接按键盘按钮进来），这一页从空框开始。
+     * 那句识别结果就落在这儿，用户接着改。空串表示没有草稿
+     * （直接按键盘按钮进来），这一页从空开始。
      *
      * [rewriteIndex] 非 null 表示这次是**编辑重发**：进来的是某条已经发过的提问
      * （[draft] 就是它的原文），发送时要把那条及其之后的全部内容作废重来，
      * 而不是当成一句新话追加进去。空串草稿在这儿不成立，所以两件事不会混。
+     * ⚠️ 2.1 起不限于「最新那一问」：任意一条用户消息都能编辑重发，
+     * 后果警告（后面会删掉几条）由 ChatScreen 的弹窗先给过。
      */
     data class Chat(
         val conversationId: String,
@@ -120,42 +128,62 @@ sealed interface InputTarget {
 }
 
 /**
- * 手表上的文字输入。
+ * 手表上的文字输入 —— **不再有内联输入框**，全部走系统的全屏输入界面。
  *
- * 实测（Wear OS 5 模拟器，Gboard Wear）：系统输入法是**整屏接管**的 ——
- * 键盘一升起来，这个页面基本全被盖住，只在顶部留一条输入预览。
+ * ## 为什么整条换掉（2.001）
  *
- * 键盘的提交在这个平台上是个坑（详见下方「提交兜底」一段）：
- * 回车键和发送箭头都未必把 ImeAction 递回来。所以这页的真实职责是：
- *  1. 进入就自动聚焦，把键盘叫起来，让用户直接打字；
- *  2. 无论用户以什么方式离开这页（返回、边缘滑动、发送按钮、语音识别完），
- *     只要框里有字，都保证把内容交出去 —— 敲过的字一个都不丢。
+ * 2.0 之前这里是 Compose `BasicTextField`，在三星 HoneyBoard 上「打进去的字不刷新」。
+ * 1.987~1.991 试过三条修法（永远写回 / 三星不上 Send / 顶部回显条），**真机全部无效**，
+ * 2.0 因此整条回滚、把问题挂成 GitHub issue #1。
+ *
+ * 结论是应用侧无解：问题出在 Compose 的 `InputConnection` 同步路径与 HoneyBoard 的
+ * composing 行为之间，键盘是整屏接管的，连「回显」都没地方放。
+ *
+ * 现在改成 Google 为 Wear 推荐的 `ACTION_REMOTE_INPUT`：输入交给**系统自己的
+ * 全屏输入 Activity**，应用只负责把结果拿回来。这条路上根本没有 Compose 的编辑控件，
+ * 也就没有任何 IME 兼容问题 —— Keep Notes 走的就是这条路。
+ *
+ * ## 代价（用户已明确接受）
+ *
+ * 1. **输入不再内联**：点这一页的输入卡 → 系统输入界面盖上来 → 确认后才回到本页看结果。
+ *    ⚠️ 2.33 起**不再自动拉起**（见下面「黑屏」一段），进页面看到的是那张「点这里开始输入」卡。
+ * 2. **拿不到预填文本**：`RemoteInput` 协议不支持带初始值进去，改 Key 这类场景
+ *    只能整段重输（原值仍显示在预览卡上，方便抄写/对照）。
+ * 3. **「离开即提交」的意义变了**：以前它是唯一的提交路径（Gboard 的回车和发送箭头
+ *    都是坏的），现在它只是**防误触兜底** —— 用户已经有一次明确的系统界面确认，
+ *    真不想发就点「取消」。
+ *
+ * ## 交互（两段式）
+ *
+ * 进页面 → **点输入卡** → 系统输入界面 → 确认 → 回到本页看到文字 → 「发送 / 保存」或「取消」。
+ * 对话目标在确认那一刻就直接发出（和语音识别完自动发同一套语义），
+ * 设置类目标停在页面上等用户复核 —— Key 这种长串输错一位就得重来。
+ *
+ * 卡片本身就是「输入 / 重新输入」按钮：想改就再点一次。
+ *
+ * ## ⚠️ 2.33：为什么不再自动拉起（用户实测反馈）
+ *
+ * 2.001 的取舍是「进页面就把系统输入界面拉起来，少点一次是一次」。但用户 2026-11-01 反馈：
+ * **进输入页唤起输入法时大概率黑屏，得返回再点一次输入框才能正常输入**。
+ *
+ * 机理：这一页拉起的是**两层独立的系统界面** —— 先是系统的 `RemoteInputActivity`
+ * （「问点什么 / 表情 / 语音 / 键盘」选择页），再是输入法自己的全屏 Activity
+ * （Gboard 的 `WearRemoteInputActivity`，手表上通常是三星/系统键盘）。
+ * 两者都是**冷启动**的进程/窗口：在导航转场还没结束时就拉起，会先出现一帧还没画好的
+ * 黑色窗口；等用户退回来再点一次时，进程已经是热的，就正常了。
+ *
+ * 修法（用户选定 A）：**去掉自动拉起，只保留「点输入卡」这一条**。这条路径天然发生在
+ * 页面已经稳定、用户主动点击之后，也就是原本「返回再点一次」能成功的那条路。
+ * 代价是每次输入多一次点击 —— 换来的是「不再黑屏、不用退出去重来」。
+ *
+ * ⚠️ 不要为了「少一点一次」把自动拉起加回来；真要加，至少等到
+ * `WindowInfo.isWindowFocused` 为真之后再延迟 300ms（但这仍挡不住键盘冷启动）。
  */
 @Composable
 fun InputScreen(target: InputTarget, onDone: () -> Unit) {
     val settings by ChatEngine.settings.state.collectAsStateWithLifecycle()
     val keyboard = LocalSoftwareKeyboardController.current
     val focusRequester = remember { FocusRequester() }
-
-    // ⚠️⚠️ 2.0：**三星键盘适配整条回滚**（用户原话：「三星键盘 bug 完全修了没用，
-    // 别修了，回显条也删除，三星键盘是全屏的也看不见」）。
-    //
-    // 1.987~1.991 那一轮按《三星键盘输入问题-定位与修复.md》落了修法 A（永远写回）、
-    // B（三星上 ImeAction.None）、C（顶部回显条）三件——**真机验证全部无效**：
-    // 三星 HoneyBoard 是整屏接管，修法 C 的回显条在键盘底下根本看不见，
-    // A/B 也没能让输入内容显示出来。问题大概率出在 Compose `BasicTextField` 与
-    // HoneyBoard 的 InputConnection 同步路径本身，应用侧无解。
-    //
-    // ⇒ 本版恢复 1.987 之前的原始行为：
-    //  * `ImeAction` 恒为 Send/Done（不再按输入法分支）；
-    //  * 回显条删除；
-    //  * ⚠️ **修法 A 的「换行也写回」保留**——它是纯行为改进（换行变空格写回
-    //    而不是吞掉），对 Gboard 无害、对三星也无害（无效但也无副作用），
-    //    删它只会让 Gboard 的回车行为退回老问题。见 onValueChange 处的注释。
-    //
-    // 若将来重启这条线，入口是 `InterceptPlatformTextInput`（修法 D，
-    // 抓 InputConnection 全量回调先取证）或 `RemoteInputIntentHelper`（修法 E，
-    // Google 官方推荐、任何 IME 都兼容，但要重做交互）——见那份定位文档。
 
     val isChat = target is InputTarget.Chat
 
@@ -197,7 +225,7 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
         InputTarget.XfyAppId -> "8 位十六进制"
         InputTarget.XfyApiKey -> "32 位十六进制"
         InputTarget.XfyApiSecret -> "32 位十六进制"
-        is InputTarget.Chat -> "打字或说句话"
+        is InputTarget.Chat -> "点这里开始输入"
         InputTarget.PersonaDescription -> "比如：一个嘴硬心软的剑修理匠"
         is InputTarget.PresetFieldEdit -> target.field()?.placeholder ?: "可以留空"
         // 长度上限写出来，用户才知道为什么会被截断（手表列表的标题位就这么宽）
@@ -215,55 +243,56 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
     }
 
     /**
-     * 输入框内容（连同光标位置）。
+     * 当前内容。
      *
-     * 之所以拿 TextFieldValue 而不是裸 String：光标位置必须显式管。
-     * `BasicTextField(value: String, …)` 这个重载内部会自己包成
-     * `TextFieldValue(text)`，而它的默认 selection 是 0 —— **光标停在第一个字前面**。
-     * 带草稿（那句识别结果）进来时这是致命的：用户想改句尾那个错字，得先在手表这块
-     * 小屏上把光标从开头一路挪到结尾，基本没法操作。
+     * ⚠️ 这里**不再需要光标**：文字只在系统输入界面里编辑，本页只负责显示和交付。
+     * 所以从 `TextFieldValue` 退回裸 `String` —— 留着那个类型只会让人以为这儿还能编辑。
      */
-    var field by remember(target) {
-        val initial = when (target) {
-            InputTarget.ApiKey -> settings.apiKey
-            InputTarget.SystemPrompt -> settings.systemPrompt
-            InputTarget.AsrUrl -> settings.asrUrl
-            InputTarget.AsrKey -> settings.asrKey
-            InputTarget.AsrModel -> settings.asrModel
-            InputTarget.XfyAppId -> settings.xfyAppId
-            InputTarget.XfyApiKey -> settings.xfyApiKey
-            InputTarget.XfyApiSecret -> settings.xfyApiSecret
-            // 带草稿进来（录音还没发就按了键盘按钮）就先填上，用户接着改就是；
-            // 没草稿则是空框，跟以前完全一样
-            is InputTarget.Chat -> target.draft
-            // 「自己说一句」永远是空框：这一句是从零开始想，没有可继承的旧值
-            InputTarget.PersonaDescription -> ""
-            // 预设那几格从页面级草稿里取，用户之前改过什么就接着改什么
-            is InputTarget.PresetFieldEdit -> ChatEngine.presetDraft.value
-                ?.takeIf { it.presetIndex == target.presetIndex }
-                ?.valueOf(target.fieldKey)
-                .orEmpty()
+    var text by remember(target) {
+        mutableStateOf(
+            when (target) {
+                InputTarget.ApiKey -> settings.apiKey
+                InputTarget.SystemPrompt -> settings.systemPrompt
+                InputTarget.AsrUrl -> settings.asrUrl
+                InputTarget.AsrKey -> settings.asrKey
+                InputTarget.AsrModel -> settings.asrModel
+                InputTarget.XfyAppId -> settings.xfyAppId
+                InputTarget.XfyApiKey -> settings.xfyApiKey
+                InputTarget.XfyApiSecret -> settings.xfyApiSecret
+                // 带草稿进来（录音还没发就按了键盘按钮）就先填上，用户接着改就是；
+                // 没草稿则是空的，跟以前完全一样
+                is InputTarget.Chat -> target.draft
+                // 「自己说一句」永远是空：这一句是从零开始想，没有可继承的旧值
+                InputTarget.PersonaDescription -> ""
+                // 预设那几格从页面级草稿里取，用户之前改过什么就接着改什么
+                is InputTarget.PresetFieldEdit -> ChatEngine.presetDraft.value
+                    ?.takeIf { it.presetIndex == target.presetIndex }
+                    ?.valueOf(target.fieldKey)
+                    .orEmpty()
 
-            is InputTarget.PersonaFieldEdit -> when (target.field) {
-                PersonaField.NAME -> ChatEngine.findPersona(target.personaId)?.name
-                PersonaField.TAGLINE -> ChatEngine.findPersona(target.personaId)?.tagline
-                PersonaField.GREETING -> ChatEngine.findPersona(target.personaId)?.greeting
-            }.orEmpty()
-        }
-        // 光标一律落在末尾：接上键盘就是接着敲，符合「改刚才那句」的直觉
-        mutableStateOf(TextFieldValue(initial, TextRange(initial.length)))
+                is InputTarget.PersonaFieldEdit -> when (target.field) {
+                    PersonaField.NAME -> ChatEngine.findPersona(target.personaId)?.name
+                    PersonaField.TAGLINE -> ChatEngine.findPersona(target.personaId)?.tagline
+                    PersonaField.GREETING -> ChatEngine.findPersona(target.personaId)?.greeting
+                }.orEmpty()
+            },
+        )
     }
 
     /** 已经提交过一次就别再自动提交（成功路径会把这面旗立起来）。 */
     var submitted by remember { mutableStateOf(false) }
 
-    /**
-     * 本地提示（识别失败之类）。
-     *
-     * 这一页的提示很难显示 —— 键盘整屏接管之后基本什么都看不见 ——
-     * 但识别失败时键盘通常已经收起，所以还是留一行，比什么都不说强。
-     */
+    /** 本地提示（识别失败之类）。 */
     var hint by remember { mutableStateOf<String?>(null) }
+
+    /**
+     * 系统输入界面拉不起来时置 true，退回内联输入。
+     *
+     * 理论上 Wear OS 一定有这个 Activity（`ACTION_REMOTE_INPUT` 从 Wear 1.0 就在），
+     * 但这里必须留退路：拉不起来的话用户会面对一张点不出任何反应的卡片，那比
+     * 「三星上看得见看不见」糟糕得多。降级路径用的是 2.0 那套内联实现。
+     */
+    var inlineFallback by remember { mutableStateOf(false) }
 
     /** 把内容写进对应的目标（发消息 / 存 Key / 存提示词 / 存识别配置），不碰导航。 */
     fun applyTarget(value: String) {
@@ -299,10 +328,9 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
     }
 
     /**
-     * 提交。raw 缺省取当前输入框内容；
-     * 键盘回车兜底那条路会把带换行的原文直接递进来。
+     * 提交。raw 缺省取当前内容。
      */
-    fun submit(raw: String = field.text) {
+    fun submit(raw: String = text) {
         val value = raw.replace('\n', ' ').trim()
         // 空值一律不提交 —— 只有一个例外：改预设的某一格时，**清空就是「这一项不要了」**。
         // 拼生成描述时空白字段本来就会被略过，所以空串在这一处是有意义的输入，
@@ -311,7 +339,6 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
         // 角色的短字段（名字 / 简介 / 开场白）**不吃这个例外**：这一页的规矩是
         // 「离开 = 提交」，而离开时框里是空的最常见的成因就是手滑 ——
         // 让那一下顺手把简介或开场白抹掉，代价比「手表上清不掉」大得多。
-        // 真要清空，去手机那一页把那一格删掉（详情页上写着这句）。
         if (value.isEmpty() && target !is InputTarget.PresetFieldEdit) return
         submitted = true
         applyTarget(value)
@@ -320,249 +347,291 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
     }
 
     /**
+     * 系统输入界面的回传。
+     *
+     * 拿到文字后的处理分两种：
+     *  * 对话目标本来就是「说完就发」，直接 submit —— 用户在系统界面按的那一下确认，
+     *    和语音识别完自动发是同一套语义；
+     *  * 设置类目标先填回本页让用户看一眼再点保存。
+     */
+    val remoteLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        // 刻意不判 resultCode：有实现即使确认了也不置 RESULT_OK，只把 data 带回来。
+        // 「有没有拿到字」用文字本身判断最靠得住。
+        val got = result.data
+            ?.let { RemoteInput.getResultsFromIntent(it) }
+            ?.getCharSequence(REMOTE_INPUT_KEY)
+            ?.toString()
+            ?.replace('\n', ' ')
+            ?.trim()
+            .orEmpty()
+        // 取消（没拿到字）就停在本页。用户可以再点卡片重来，或者直接取消离开。
+        if (got.isEmpty()) return@rememberLauncherForActivityResult
+        text = got
+        if (isChat) submit(got)
+    }
+
+    /** 拉起系统输入界面；拉不起来就降级成内联输入。 */
+    fun launchRemoteInput() {
+        // ⚠️ `INPUT_ACTION_TYPE` 这个 extra 是必需的，不是可选项。
+        // 不传它，Gboard 的输入界面不知道该把右下角那颗键画成「发送」还是「换行」，
+        // 表现是：字能打出来、点了键也清空，但**结果不回传**，页面停在原地。
+        // 模拟器实测就卡在这里。取值见 WearableRemoteInputExtender 的反编译结果：
+        //   0=SEND 1=SEARCH 2=DONE 3=GO
+        // 对话是「发送」，设置类是「保存」，各自对上。
+        val actionType = if (isChat) INPUT_ACTION_SEND else INPUT_ACTION_DONE
+        val input = RemoteInput.Builder(REMOTE_INPUT_KEY)
+            .setLabel(title)
+            .addExtras(
+                Bundle().apply {
+                    putInt(EXTRA_INPUT_ACTION_TYPE, actionType)
+                },
+            )
+            .build()
+        val intent = Intent(ACTION_REMOTE_INPUT).apply {
+            putExtra(EXTRA_REMOTE_INPUTS, arrayOf(input))
+            putExtra(EXTRA_TITLE, title)
+            putExtra(EXTRA_CONFIRM_LABEL, confirmLabel)
+        }
+        if (runCatching { remoteLauncher.launch(intent) }.isFailure) {
+            inlineFallback = true
+            focusRequester.requestFocus()
+            keyboard?.show()
+        }
+    }
+
+    /**
      * 这一页的麦克风：**说完先出字、你改完再发**，和对话页那支刻意不一样。
      *
-     * 差别来自语境：用户已经站在编辑页上、键盘也开着，「先填字再发」在这里不是中断
-     * 而是顺路；对话页没有输入框，同样的行为就成了跳转。识别错字是常态
-     * （「骁龙8gen3」听成「8阵3」），这一页本来就给了改字的机会，不如先用上。
+     * 差别来自语境：用户已经站在编辑页上，识别错字是常态（「骁龙8gen3」听成「8阵3」），
+     * 这一页本来就给了改字的机会，不如先用上。
      */
     val voice = rememberVoiceInput(
-        onResult = { spoken ->
-            field = TextFieldValue(spoken, TextRange(spoken.length))
-        },
+        onResult = { spoken -> text = spoken },
         onMessage = { message -> hint = message },
-        // 边说边把识别到的字填进输入框：识别得对不对，当场就能看出来
-        onPartial = { partial ->
-            field = TextFieldValue(partial, TextRange(partial.length))
-        },
+        // 边说边把识别到的字填进来：识别得对不对，当场就能看出来
+        onPartial = { partial -> text = partial },
     )
 
     // ---------------------------------------------------------------- 提交兜底
     //
-    // Wear 版 Gboard（Wear OS 5 实测）的回车键和发送箭头都是坏的：
-    //  * 回车既不走 ImeAction.Send，也不往输入框提交换行 —— onValueChange 什么都收不到；
-    //  * 发送箭头点了没有任何反应；
-    //  * 整屏键盘盖住了下面的「发送/保存」按钮，返回手势还会把整页 pop 掉、字全丢。
-    // 结果就是：用户敲完字，没有任何办法交出去 —— 看起来「问答完全不可用」。
+    // ⚠️ 2.001：提交路径现在是**明确的**（系统界面确认 → 本页按钮），这套兜底的意义
+    // 从「唯一的提交方式」降级成「防误触兜底」：在手表这块屏上，边缘滑动很容易被误触，
+    // 用户敲完一段话却因为手一滑丢掉，比多存一条更难受。
     //
-    // 返回是唯一百分之百会递到应用手里的手势，所以把「离开输入页」定成提交动作：
-    // 有内容就发送/保存，一个字都不白敲；想放弃就先把字删空。
-    BackHandler(enabled = !submitted && field.text.isNotBlank()) { submit() }
+    // 所以语义保持不变：**有内容、没提交，离开就交出去**。想放弃必须点「取消」
+    // （它先把 submitted 立起来，跳过下面两道兜底），或者把内容清空。
+    BackHandler(enabled = !submitted && text.isNotBlank()) { submit() }
 
-    // 再兜一层：SwipeDismissableNavHost 的边缘滑动在部分系统上不走 BackHandler，
-    // 页面被划走时（onDispose）把还没交出去的内容补交掉，别让用户白打一段话。
-    // 注意这里只写数据、不做导航 —— onDispose 阶段再 popBackStack 是未定义行为。
-    //
-    // 带草稿进来时沿用同一条规矩：划走 = 认可框里这串字、把它发出去。
-    // 不另立一套语义是有意的 —— 「不想发就先把字删空」这个约定在打字页早已存在，
-    // 同一个页面里出现两种"离开"的含义只会让人更不敢动。
+    // 再兜一层：SwipeDismissableNavHost 的边缘滑动在部分系统上不走 BackHandler。
+    // 只写数据、不做导航 —— onDispose 阶段再 popBackStack 是未定义行为。
     DisposableEffect(target) {
         onDispose {
-            // 这里读 field 而不是某个快照值：onDispose 只在离开这一页时跑一次，
+            // 这里读 text 而不是某个快照值：onDispose 只在离开这一页时跑一次，
             // 而 DisposableEffect 的 key 是 target、中途不会重建 —— 任何在组合期
-            // 捕获下来的字符串都会是「刚进页面时」的旧值，用户后来敲的字会丢。
-            if (!submitted && field.text.isNotBlank()) {
+            // 捕获下来的字符串都会是「刚进页面时」的旧值。
+            if (!submitted && text.isNotBlank()) {
                 submitted = true
-                applyTarget(field.text.trim())
+                applyTarget(text.trim())
             }
         }
     }
 
-    // 这一页没有可滚动列表，但照样走 ScreenScaffold：
-    // 它会给出正确的 contentPadding，让内容避开圆屏顶部的时间胶囊和圆边。
-    ScreenScaffold { contentPadding ->
-        Column(
+    // 这一页按官方「滚动应用布局」做成可滚的：输入卡 + 状态行 + 操作行三个元素
+    // 竖排在一个 ScalingLazyColumn 里。此前是固定 Column —— 预览文本一长
+    // （系统提示词这种 119 字的），卡片被撑高，「保存/取消」那行就被顶出圆屏下沿，
+    // 按钮只露一半（2.1.1 用户截图）。官方对这类「内容可能超高」的页的答案就是
+    // 滚动布局：内容按顺序滚，「按钮列表」排在内容末尾、天然跟着进来。
+    //
+    // ⚠️ ScreenScaffold 的 scrollState + ScalingLazyColumn 的 autoCentering 组合：
+    //   * autoCentering = null + 顶部/底部 GapItem：内容少时不强推到圆心，
+    //     首屏和旧版 Column 的观感一致；内容多时能滚到底、按钮完整可点。
+    //   * 滚动指示器（ScrollIndicator）交给 ScreenScaffold 的槽，滚起来才出现。
+    val scrollState = rememberScalingLazyListState()
+    ScreenScaffold(
+        scrollState = scrollState,
+        scrollIndicator = { ScrollIndicator(state = scrollState) },
+    ) { contentPadding ->
+        ScalingLazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(contentPadding)
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .padding(contentPadding),
+            state = scrollState,
+            autoCentering = null,
+            contentPadding = PaddingValues(top = 0.dp, bottom = 28.dp),
         ) {
-            // ⚠️⚠️ 2.0：1.987 加的「实时回显条」已删除（用户原话：「回显条也删除，
-            // 三星键盘是全屏的也看不见」）。三星 HoneyBoard 整屏接管后键盘下面
-            // 什么都看不见，这条镜子没有观众。Gboard 下它也只在「输入框被键盘
-            // 压住」的场景有用，而那不是常态。
+            // 顶部留白：避开时间胶囊。ScreenScaffold 的 contentPadding 已含
+            // 顶部 10% 屏高，这里只是给首项一点呼吸（旧版 Column 的 8dp 行距等价物）。
+            item(key = "top_gap") { GapItem(4.dp) }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                Card(
-                    onClick = { focusRequester.requestFocus() },
-                    modifier = Modifier.weight(1f),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
-                    ),
+            item(key = "input") {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            text = title,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        BasicTextField(
-                            value = field,
-                            onValueChange = { value ->
-                                // ============================================================
-                                // ⚠️⚠️ 1.987：这条分支重写了（三星键盘输入不刷新的修法 A）
-                                // ============================================================
-                                //
-                                // ## 改前的写法（也是「三星键盘下输入不刷新」的根因）
-                                //
-                                // ```kotlin
-                                // if ('\n' in value.text) { submit(value.text) }  // ← 不写回 field
-                                // else { field = value }
-                                // ```
-                                //
-                                // 那条「换行 → 提交且不写回」的分支当初是为 **Wear 版 Gboard**
-                                // 写的（它的回车不走 ImeAction.Send，而是往输入框塞换行）。
-                                // **三星 HoneyBoard 的 composing 行为不同**：它会一次性 commit
-                                // 整段 composing 文本（常见带尾部 `\n`），一旦命中这个分支 ⇒
-                                // `submit()` 触发、**`field` 停在旧值** ⇒ Compose 的
-                                // EditingBuffer 与 IME 立刻失步 ⇒ 用户看到的就是
-                                // 「输入内容不更新：只有每次唤起时的文字显示，之后改/增都不显示」。
-                                //
-                                // 定位与机制见会话目录《三星键盘输入问题-定位与修复.md》
-                                // （嫌疑 A，判定表第 2/3 行）。
-                                //
-                                // ## 修法（文档「修法 A」原样落地）
-                                //
-                                // **不管 IME 送什么，都先写回 state**（2.0 保留这一条）；
-                                // 提交动作交给「离开 = 提交」的既有兜底
-                                // （BackHandler / onDispose，不依赖 IME 动作）。
-                                //  * ⚠️ 光标必须跟着给（`TextRange(cleaned.length)`）：
-                                //    写回不带 selection 会落到 0，这是本项目踩过的坑。
-                                //  * Gboard 的「回车塞换行」依然被处理：换行变空格留在框里，
-                                //    不是吞掉；「敲完就发」由 BackHandler 承接。
-                                //  * 1.987 曾试图把它当三星修复的一部分——真机验证三星无效
-                                //    （见上面 2.0 的回滚说明），但这条本身无害且对 Gboard 有益，
-                                //    **保留不回滚**。
-                                val raw = value.text
-                                if ('\n' in raw) {
-                                    val cleaned = raw.replace('\n', ' ')
-                                    field = TextFieldValue(cleaned, TextRange(cleaned.length))
-                                } else {
-                                    field = value
-                                }
+                    Card(
+                        // 这张卡就是「重新输入」：本页没有可编辑的输入框，想改只能回系统界面。
+                        onClick = { launchRemoteInput() },
+                        modifier = Modifier.weight(1f),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            contentColor = MaterialTheme.colorScheme.onSurface,
+                        ),
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = title,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            if (inlineFallback) {
+                                // 极少数设备才走这里（拉不起系统输入界面）。实现与 2.0 相同，
+                                // 包括那条「换行也写回 state」的修法 —— 它是纯行为改进，
+                                // 对任何 IME 都无害。
+                                BasicTextField(
+                                    value = TextFieldValue(text, TextRange(text.length)),
+                                    onValueChange = { value ->
+                                        val raw = value.text
+                                        text = if ('\n' in raw) raw.replace('\n', ' ') else raw
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .focusRequester(focusRequester),
+                                    textStyle = MaterialTheme.typography.bodyLarge.copy(
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    ),
+                                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                                    keyboardOptions = KeyboardOptions(
+                                        imeAction = if (isChat) ImeAction.Send else ImeAction.Done,
+                                    ),
+                                    keyboardActions = KeyboardActions(
+                                        onSend = { submit() },
+                                        onDone = { submit() },
+                                    ),
+                                    decorationBox = { innerTextField ->
+                                        if (text.isEmpty()) {
+                                            Text(
+                                                text = placeholder,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
+                                        innerTextField()
+                                    },
+                                )
+                            } else {
+                                // 只读预览。⚠️ 不设 maxLines：这块屏上长内容宁可撑高一点，
+                                // 也别把用户刚确认的那句话截掉一半 —— 他就是要复核它。
+                                // 整页现在可滚，卡片撑高不再挤走按钮。
+                                Text(
+                                    text = text.ifEmpty { placeholder },
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = if (text.isEmpty()) {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    },
+                                    maxLines = 4,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+
+                    FilledIconButton(
+                        onClick = {
+                            if (voice.phase == VoicePhase.RECORDING) voice.stop() else voice.start()
+                        },
+                        // 上传识别中再点没有意义（取消不了已经发出去的那次请求），
+                        // 与其让它看起来能点、点了没反应，不如明确置灰
+                        enabled = voice.phase != VoicePhase.TRANSCRIBING,
+                        modifier = Modifier.size(40.dp),
+                    ) {
+                        Icon(
+                            imageVector = if (voice.phase == VoicePhase.RECORDING) {
+                                AppIcons.Stop
+                            } else {
+                                AppIcons.Mic
                             },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .focusRequester(focusRequester),
-                            textStyle = MaterialTheme.typography.bodyLarge.copy(
-                                color = MaterialTheme.colorScheme.onSurface,
-                            ),
-                            // 刻意**不设** singleLine：Wear 版 Gboard 的回车不走
-                            // ImeAction，而是往输入框塞换行（本地实测）；singleLine
-                            // 会把这个换行在回调之前就过滤掉，下面的拦截就永远不触发。
-                            // 换行一进来就提交并吞掉，输入框实际上仍然保持单行。
-                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                            keyboardOptions = KeyboardOptions(
-                                // ⚠️ 2.0：恢复 1.987 前的写法（恒为 Send/Done）。
-                                // 1.987 的「三星走 None」分支随整条三星适配回滚删除
-                                // （真机验证无效，见上）。
-                                imeAction = if (isChat) ImeAction.Send else ImeAction.Done,
-                            ),
-                            keyboardActions = KeyboardActions(
-                                onSend = { submit() },
-                                onDone = { submit() },
-                            ),
-                            decorationBox = { innerTextField ->
-                                Box {
-                                    if (field.text.isEmpty()) {
-                                        Text(
-                                            text = placeholder,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
-                                    innerTextField()
-                                }
+                            contentDescription = if (voice.phase == VoicePhase.RECORDING) {
+                                "结束录音并识别"
+                            } else {
+                                "语音输入"
                             },
+                            modifier = Modifier.size(18.dp),
                         )
                     }
                 }
-
-                FilledIconButton(
-                    onClick = {
-                        if (voice.phase == VoicePhase.RECORDING) voice.stop() else voice.start()
-                    },
-                    // 上传识别中再点没有意义（取消不了已经发出去的那次请求），
-                    // 与其让它看起来能点、点了没反应，不如明确置灰
-                    enabled = voice.phase != VoicePhase.TRANSCRIBING,
-                    modifier = Modifier.size(40.dp),
-                ) {
-                    Icon(
-                        imageVector = if (voice.phase == VoicePhase.RECORDING) {
-                            AppIcons.Stop
-                        } else {
-                            AppIcons.Mic
-                        },
-                        contentDescription = if (voice.phase == VoicePhase.RECORDING) {
-                            "结束录音并识别"
-                        } else {
-                            "语音输入"
-                        },
-                        modifier = Modifier.size(18.dp),
-                    )
-                }
             }
 
-            hint?.let { message ->
+            item(key = "status") {
+                // 一行状态说明，三种情况按优先级：
+                //  * 本地提示（识别失败等）—— 红字，必须被看见；
+                //  * 系统界面拉不起来 —— 说明为什么多出一个内联框；
+                //  * 常态 —— 告诉用户这张卡可以点（否则一个不能编辑的框会让人以为坏了）。
+                val statusLine = hint ?: when {
+                    inlineFallback -> "系统输入界面不可用，已切换为直接输入"
+                    else -> "点上方卡片可以修改"
+                }
                 Text(
-                    text = message,
+                    text = statusLine,
                     style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.fillMaxWidth(),
+                    color = if (hint != null) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
                     textAlign = TextAlign.Center,
                 )
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                FilledTonalButton(
-                    onClick = { submit() },
-                    modifier = Modifier.weight(1f),
+            item(key = "actions") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        // 官方「元素之间」间距 4dp 的档位；再给操作行留出
+                        // 与状态的呼吸空间，滚动到底时按钮完整落在圆内
+                        // （ScalingLazyColumn 的 contentPadding.bottom 再兜一层）。
+                        .padding(top = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    Icon(
-                        imageVector = AppIcons.Check,
-                        contentDescription = null,
-                        modifier = Modifier
-                            .size(18.dp)
-                            .padding(end = 4.dp),
-                    )
-                    Text(
-                        text = when {
-                            voice.phase == VoicePhase.TRANSCRIBING -> "识别中"
-                            voice.listening -> "聆听中"
-                            else -> confirmLabel
+                    FilledTonalButton(
+                        onClick = { submit() },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(
+                            imageVector = AppIcons.Check,
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .padding(end = 4.dp),
+                        )
+                        Text(
+                            text = when {
+                                voice.phase == VoicePhase.TRANSCRIBING -> "识别中"
+                                voice.listening -> "聆听中"
+                                else -> confirmLabel
+                            },
+                            maxLines = 1,
+                        )
+                    }
+                    TextButton(
+                        // 取消 = 明确放弃：先把旗立起来，跳过 BackHandler/onDispose 两道
+                        // 提交兜底 —— 否则「取消」也会把内容偷偷存进去，取消就名存实亡
+                        onClick = {
+                            submitted = true
+                            onDone()
                         },
-                        maxLines = 1,
-                    )
-                }
-                TextButton(
-                    // 取消 = 明确放弃：先把旗立起来，跳过 BackHandler/onDispose 两道
-                    // 提交兜底 —— 否则「取消」也会把框里的字偷偷存进去，取消就名存实亡
-                    onClick = {
-                        submitted = true
-                        onDone()
-                    },
-                    modifier = Modifier.width(64.dp),
-                ) {
-                    Text("取消", maxLines = 1, textAlign = TextAlign.Center)
+                        modifier = Modifier.width(64.dp),
+                    ) {
+                        Text("取消", maxLines = 1, textAlign = TextAlign.Center)
+                    }
                 }
             }
         }
-    }
-
-    // 进页面就把键盘叫起来，少一次点击；万一系统没弹出来，点一下输入框也一样
-    LaunchedEffect(target) {
-        focusRequester.requestFocus()
-        keyboard?.show()
     }
 }
 
@@ -574,3 +643,34 @@ fun InputScreen(target: InputTarget, onDone: () -> Unit) {
  */
 private fun InputTarget.PresetFieldEdit.field(): PresetField? =
     personaPresets().getOrNull(presetIndex)?.fields?.firstOrNull { it.key == fieldKey }
+
+// ------------------------------------------------------------------ 系统输入界面的协议
+//
+// 为什么是「手抄协议」而不是加 `androidx.wear:wear-input` 依赖：
+// 那个库只干一件事 —— 拼这几个字符串常量。为了 4 个字符串引入一个 aar，
+// 在这台长期离线构建的机器上要额外解决依赖解析，不值。常量取值直接从
+// wear-input 1.1.0 的 aar 里反编译核对过（`RemoteInputIntentHelper`）：
+//   * ACTION_REMOTE_INPUT —— Intent 的 action
+//   * EXTRA_REMOTE_INPUTS —— **RemoteInput 的数组**（不是 ArrayList）
+//   * EXTRA_TITLE / EXTRA_CONFIRM_LABEL —— 系统界面上的标题与确认键
+// 这三个是 Wear 平台的跨进程契约（命名空间还是 Wear 1.0 时代的
+// `android.support.wearable`），不随 AndroidX 版本变。
+private const val ACTION_REMOTE_INPUT = "android.support.wearable.input.action.REMOTE_INPUT"
+private const val EXTRA_REMOTE_INPUTS = "android.support.wearable.input.extra.REMOTE_INPUTS"
+private const val EXTRA_TITLE = "android.support.wearable.input.extra.TITLE"
+private const val EXTRA_CONFIRM_LABEL = "android.support.wearable.input.extra.CONFIRM_LABEL"
+
+/**
+ * 输入法的「动作类型」。
+ *
+ * ⚠️ 这个 extra 挂在 **`RemoteInput` 自己的 extras** 上（`Builder.addExtras`），
+ * 不是 Intent 上 —— 反编译 `WearableRemoteInputExtender.get()` 确认过。
+ */
+private const val EXTRA_INPUT_ACTION_TYPE = "android.support.wearable.input.extra.INPUT_ACTION_TYPE"
+
+/** `INPUT_ACTION_TYPE` 的取值（同一份反编译结果）。 */
+private const val INPUT_ACTION_SEND = 0
+private const val INPUT_ACTION_DONE = 2
+
+/** 结果回传用的 key，自己定；系统界面只负责原样带回来。 */
+private const val REMOTE_INPUT_KEY = "whalechat.input"

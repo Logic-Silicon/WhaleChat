@@ -126,7 +126,11 @@ data class PresetDraft(
 private val PRESETS: List<PersonaPreset> = listOf(
     PersonaPreset(
         title = "大肥鱼",
-        subtitle = "吃白饭的AI女仆",
+        // 2.34：它不再是「AI 女仆」，而是**五皮肤**里的第一条鱼。
+        // 副标题原来写的是「吃白饭的AI女仆」（2.1 的设定），和五份人设稿对不上 ——
+        // 用户 2026-11-01 拍板改成现在这句：先告诉用户「点进去要挑」，
+        // 而不是先给一个会被皮肤推翻的身份。
+        subtitle = "五个性格，先挑一条",
         // description / fields 对这条旁路是**不用的**（见 direct）。
         // 留空字符串而不是留一句占位文案：万一将来有人误把它接回生成管道，
         // 空描述会当场在 PersonaFactory 里被拦下（「先说说你想要什么样的人」），

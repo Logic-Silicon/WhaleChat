@@ -80,62 +80,62 @@ private val DISPLAY_GROUP_GAP = 16.dp
 private val ABOUT_GROUP_GAP = 16.dp
 
 /**
- * 「清空对话」/「关于 WhaleChat」这两张**只有一行文字**的入口卡的高度。
+ * 设置页底部那两张单行入口卡（「清空对话」「关于 WhaleChat」）—— **2.2 回到 M3E 标准形态**。
  *
- * ## ⚠️⚠️ 这是本轮最典型的那个 Wear M3 公共陷阱
+ * ## 这次改的是「和上面那组不是一套语言」，不是回退 1.982
  *
- * `Card` 自带 `Modifier.cardSizeModifier()`（`Card.kt:929`）：
- * ```kotlin
- * private fun Modifier.cardSizeModifier(): Modifier =
- *     defaultMinSize(minHeight = CardDefaults.Height)   // = CardTokens.ContainerMinHeight = 64.dp
- * ```
- * ⇒ **内容再矮也会被撑到 64dp**（@2.0 = 128px），
- * 这正是用户说的「明明一行文字选项卡片却是两行高度」。
+ * 1.982 因为用户原话「明明一行文字选项卡片却是两行高度」，把这两张卡从 `Card` 默认的
+ * 64dp 压到了 **48dp**，并且「清空对话」是**居中**的一行字、**没有图标**。
+ * 那一版的手感是对的，但它和上面那组 `ActionCard`（图标 + 左对齐标题）成了两套语言：
+ * 高度不同、有没有图标不同、对齐不同 —— 这正是 2.2 用户说的
+ * 「**实在不与上面的 m3e 设计贴近**」。
  *
- * ⚠️ **调 `contentPadding` 压不下去**：`Card` 的 `modifier` 是在
- * `CardImpl` 里先 `.fillMaxWidth().surface().combinedClickable()` 再把
- * `modifier` 接在**最前面**的（`CardImpl` 源码里 `modifier.fillMaxWidth()...`），
- * 于是 `defaultMinSize(64.dp)` 作用在**外层、还要再受一次外层约束**，
- * 把纵向内边距压到 0 也一样被撑到 64dp。
+ * ⇒ 本轮是**有意的第二次调整**，两件事要一起满足：
+ *  1. 不能回到「一行文字两行高度」；
+ *  2. 要和上面那组 M3E 卡片是同一套语言。
  *
- * ⚠️ **唯一有效杠杆是显式 `Modifier.height(h)`**：`Modifier.height` 是
- * `SizeElement(enforceIncoming = true)`，它把**外层约束**钉成 min=max=h
- * （`Size.kt` → `SizeNode.measure`：`enforceIncoming = true` 时用强制出的
- * `targetConstraints`）。内层 `defaultMinSize` 的判据是
- * `constraints.minHeight == 0`（`Size.kt:1085`，`UnspecifiedConstraintsNode`），
- * 而外层已经把它抬到 h ≠ 0 ⇒ **`defaultMinSize` 直接让位**，卡片就是 h。
+ * ## 做法：两张卡都用 `ActionCard`，**不再手写 Card + Box + 居中 Text**
  *
- * ## ⚠️⚠️ 配套：给了高度就**必须**把 `contentPadding` 纵向一起压到 0
+ * `ActionCard`（`Components.kt`）本来就带着「图标 + 左对齐标题 + `Box(fillMaxSize,
+ * CenterStart)` 垂直居中」，20 多个调用点都在用它 —— 复用它而不是再写一遍，
+ * 是「同一套语言」最省事、也最不可能分叉的做法。
  *
- * 两件事缺一不可（1.978 踩过一次，症状是「整张卡画不出来」）：
- * 卡片内部的 `Column` 先吃 `contentPadding`，`Text` 拿到的是**剩下的**高度。
- * 默认纵向内边距是 12 + 12 = 24dp，`h = 48dp` 时留给文字只剩 24dp ——
- * 加上 `titleMedium` 行盒 18sp（≈22dp）勉强够，再矮一点就是 **0 高、整个画不出来**
- * （截图空白，`uiautomator dump` 里连节点都没有）。
+ * ⚠️ **删掉了 `SINGLE_LINE_CARD_HEIGHT` / `SINGLE_LINE_CARD_PADDING` 两个常量**
+ * （连同原来解释「为什么是 48dp」的那一大段注释）：那段注释解释的前提已经不存在，
+ * 留着它就是一段**撒谎的注释**。现在高度由 `Card` 自己的
+ * `defaultMinSize(minHeight = CardTokens.ContainerMinHeight = 64.dp)` 决定
+ * —— 就是 M3E 的卡片标准高度，也就是上面那组卡片的高度，不用再写 `Modifier.height`。
  *
- * ⚠️ **`fillMaxWidth()` 也要在**：居中/换行依赖它给的确定宽度。
- * 顺序上 `height` 与 `fillMaxWidth` 谁先谁后无所谓，但两个都要挂。
+ * ⚠️ **仍然是「一行文字」，不是「两行高度」**：卡片里只有一行 `titleMedium`，
+ * 多出来的 64 − 行盒(≈22dp) − 上下内边距(12+12dp) ≈ 18dp 由 `ActionCard` 内部的
+ * `Box(CenterStart)` **上下均分**（实测见报告：上空隙 ≈ 下空隙）。
+ * 这也正是 1.982 手写 `Box(Center)` 想解决的事，现在由组件统一负责。
  *
- * ## 为什么是 48dp
+ * ⚠️ 破坏性语义不变：**「清空对话」的图标和文字是 error 色，但容器仍是
+ * `surfaceContainer`**（不整块刷红）—— 与长按菜单里的破坏性项同一套判断。
  *
- * 这两张卡的内容都只有**一行** `titleMedium`：
- * 行盒 = `lineHeight` 18sp ⇒ 18 × 2 = 36px @2.0 = **18dp**（墨迹更低，约 12dp）。
- * `48 − 0（纵向内边距）= 48dp` 可用，是行盒的 2.7 倍 —— 量出来绝不会是 0 高。
- *
- * 为什么不取 [HomeScreen] 会话卡的 `56.dp`：那张卡是**两行**（标题 + 副标题），
- * 56dp 是「内容自然高 54dp 再加 2dp」的结果；这里只有一行，
- * 照抄 56dp 就等于把用户抱怨的「两行高度」从 64 换成 56，问题只解决了一半。
- *
- * 为什么不更矮（40dp）：圆屏上这块可点区域还要过 M3E 的触控与按压动效，
- * 而且 48dp 是 M3 体系里通用的最小触控尺寸，**别再往下压**。
- * 这个值**必须装机实测复核**（见报告：改前/改后高度 px）。 */
-private val SINGLE_LINE_CARD_HEIGHT = 48.dp
+ * ⚠️ **「共 N 条」必须保留**：它是用户判断「要不要清」的唯一依据，
+ * 所以卡片的 `title` 还是「清空对话 · 共 N 条」，并且 `titleMaxLines = 1` + Ellipsis
+ * （1.978 实测过：可用宽约 214dp，三位数条数就会换行，换行就把整组顶下去）。
+ */
 
 /**
- * 单行卡片的内边距。**横向照旧 12dp，纵向必须是 0** —— 理由见
- * [SINGLE_LINE_CARD_HEIGHT] 的「配套」一段（纵向留着内边距会把文字挤成 0 高）。
+ * 设置页这两张单行卡的显式高度 = `CardTokens.ContainerMinHeight` 的 64dp（M3E 卡片标准高度）。
+ *
+ * ⚠️ **为什么明明「不需要写高度」还是要写**（2.2 实测踩到的）：
+ * 不写 `Modifier.height` 时，`Card` 的 `defaultMinSize(64.dp)` 只是把**卡片最终尺寸**
+ * 抬到 64dp，**没有把 64dp 作为最小约束下发给内容** —— 卡片内部 `ActionCard` 那个
+ * `Box(Modifier.fillMaxSize(), contentAlignment = CenterStart)` 拿到的高度是内容自然高
+ * （一行文字 ≈ 49px），`fillMaxSize` 撑不满、居中无处可移。
+ * 实测（改前）：卡片 `y=[39,173]`、文字 `y=[64,113]` ⇒ **上空隙 25px / 下空隙 60px**，
+ * 文字明显贴上沿。给了显式 `height(64.dp)` 之后高度变成有界约束，`Box` 才真的居中
+ * （实测上下空隙均 33px，见报告）。
+ *
+ * ⚠️ 64dp 是 **M3E 卡片标准高度**，不是「两行文字的高度」—— 卡片里只有一行字，
+ * 这正是 4.4.2 要求的判据。
  */
-private val SINGLE_LINE_CARD_PADDING = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
+private val SETTINGS_CARD_HEIGHT = 64.dp
+
 
 /**
  * 「显示设置」二级页入口是否可见。
@@ -451,6 +451,37 @@ fun SettingsScreen(
                 )
             }
 
+            // ★ 主动消息开关（2.35）：**角色聊天专属**，所以只在从 chat 进来时出现。
+            // 理由和「系统提示词只在 ask 出现」是同一条：这一页两个来源本来就同构不同内容，
+            // 把只对角色会话生效的开关摆在 ask 那份里，等于暗示它管 Ask。
+            //
+            // ⚠️ 文案：标题只放「她会主动开口」，副标题说清**什么时候**会开口。
+            // 不要再写「每天最多两次 / 只在 7–22 点」这类规则说明 —— 圆屏放不下，
+            // 而且那是实现细节，用户只要知道「隔久了会先说一句」。
+            if (isChatOrigin) {
+                item(key = "proactive_header") { ListSubHeader { Text("角色聊天") } }
+                item(key = "proactive") {
+                    SwitchButton(
+                        checked = settings.proactiveEnabled,
+                        onCheckedChange = { on -> ChatEngine.settings.setProactiveEnabled(on) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = {
+                            Text(
+                                text = "她会主动开口",
+                                style = MaterialTheme.typography.bodyLarge,
+                            )
+                        },
+                        secondaryLabel = {
+                            Text(
+                                text = "打开会话时，隔得久了让她先说一句",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        },
+                    )
+                }
+            }
+
             // 「系统提示词」只管 ask。chat 那边的 prompt 是**人设六块 + CHAT_OUTPUT_RULES**
             // 每次发送时现拼的（见 `ChatEngine.startStream`），全局这一套**根本不参与** ——
             // 从 chat 进来摆这个入口，就是在暗示「这里改的东西对这个角色生效」，而它并不生效。
@@ -508,63 +539,25 @@ fun SettingsScreen(
                 item(key = "data_header") { ListSubHeader { Text("数据") } }
 
                 item(key = "clear") {
-                    // ⚠️⚠️ 1.982：`height` + `contentPadding` 纵向 0 **两件事缺一不可**，
-                    // 理由（`Card` 自带的 `defaultMinSize(64.dp)` 陷阱）见
-                    // [SINGLE_LINE_CARD_HEIGHT] 那段长注释。少给任何一样都会出事：
-                    //  * 只给 `height` 不给 `contentPadding` ⇒ 纵向 24dp 内边距吃掉内容，
-                    //    `Text` 量成 0 高、**整张卡画不出来**；
-                    //  * 只给 `contentPadding` 不给 `height` ⇒ `defaultMinSize` 照样撑到 64dp，
-                    //    用户抱怨的「一行文字两行高度」一点没改。
-                    Card(
+                    // ⚠️ 2.2：**不再手写 `Card` + `Box(Center)` + 居中 `Text`** ——
+                    // 那张卡的形态（居中、无图标、48dp）就是用户说的「不与上面的 m3e 设计贴近」。
+                    // 现在复用上面那组一模一样的 `ActionCard`：
+                    // 图标 + **左对齐**标题 + 垂直居中，高度吃 `Card` 自己的 64dp 标准高度。
+                    // 破坏性语义靠 `contentColor = error`（灰容器 + error 图标文字，
+                    // 不整块刷红，和长按菜单里的破坏性项同一套判断）。
+                    ActionCard(
+                        title = "清空对话 · 共 " +
+                            "${conversations.count { it.messages.isNotEmpty() }} 条",
+                        icon = AppIcons.Delete,
                         onClick = { confirmClear = true },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(SINGLE_LINE_CARD_HEIGHT),
-                        contentPadding = SINGLE_LINE_CARD_PADDING,
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                            contentColor = MaterialTheme.colorScheme.error,
-                        ),
-                    ) {
-                        // ⚠️⚠️ 1.982 补：**必须外面套一个撑满的 `Box` 并给 `contentAlignment`**，
-                        // 光靠 `Text` 自己是垂直居中不了的。
-                        //
-                        // 第一版只给了 `Text(modifier = fillMaxWidth(), textAlign = Center)`，
-                        // 实测 **上空隙 0px / 下空隙 53px** —— 文字贴在卡片上沿。
-                        // 根因：纵向 `contentPadding` 被压到 0 之后，`Card` 内部那个
-                        // `Column`（默认 `Arrangement.Top`）里就再没有东西把文字往下推，
-                        // 多出来的高度**全落在文字下面**。
-                        // **「卡片矮了」和「文字在卡片里居中」是两件事** —— 我上一轮只验了前者。
-                        //
-                        // 这里不用 `Text(fillMaxHeight)`：那只是把 `Text` 的**布局框**撑高，
-                        // 文字在框内落在哪儿是 `BasicText` 内部的事，不该靠猜。
-                        // 套 `Box` + `contentAlignment` 是**几何上确定**的居中。
-                        Box(
-                            modifier = Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                // 空白的新对话不算记录，条数里也不该有它们
-                                text = "清空对话 · 共 ${conversations.count { it.messages.isNotEmpty() }} 条",
-                                style = MaterialTheme.typography.titleMedium,
-                                modifier = Modifier.fillMaxWidth(),
-                                textAlign = TextAlign.Center,
-                                // ⚠️ 1.978：卡片文案里去掉了「所有」两个字（原「清空所有对话 · 共 N 条」），
-                                // 并补上 `maxLines = 1` + Ellipsis。
-                                //
-                                // 原因：这个卡片的可用宽只有 214dp 出头，`titleMedium` 下
-                                // 「清空所有对话 · 共 999 条」已经超过一行 —— 而 Text 没有 maxLines
-                                // 时**只会换行不会裁字**，于是卡片凭空长高一行，
-                                // 把「数据」这一组整块往下顶，圆屏下沿开始切东西。
-                                // 三位数条数是日常状态（不是极端值），不能靠「用户不会存那么多」搪塞。
-                                //
-                                // 两道一起上：改短文案（正常情况根本不触发截断）+ maxLines 兜底
-                                // （真出现 5 位数也不会把版式顶歪）。**别再退回长文案。**
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                    }
+                        contentColor = MaterialTheme.colorScheme.error,
+                        // 「共 N 条」必须保留（用户判断要不要清的唯一依据），
+                        // 但只能占一行：三位数条数在 214dp 可用宽里就会换行，
+                        // 一换行整张卡长高、把这一组往下顶（1.978 实测）。
+                        titleMaxLines = 1,
+                        // 64dp（M3E 卡片标准）+ Box 垂直居中，理由见 [SETTINGS_CARD_HEIGHT]。
+                        modifier = Modifier.height(SETTINGS_CARD_HEIGHT),
+                    )
                 }
             }
 
@@ -642,16 +635,18 @@ fun SettingsScreen(
                     // 哪天把那个入口放回来，这两张卡要有一个换图标，否则上下两张同图标会认不出。
                     icon = AppIcons.Bubble,
                     onClick = onOpenAbout,
-                    // ⚠️ 1.982：**两张单行卡一起压到同一高度**。
-                    // 用户只点了「清空对话」那张，但这两张卡现在**本来就一样高**
-                    // （都吃 `defaultMinSize(64.dp)`），只压一张会让下面这张莫名高出一截，
-                    // 看起来像没对齐 —— 比两张都高更难看。所以一起压，理由写在
-                    // [SINGLE_LINE_CARD_HEIGHT] 上。
+                    // ⚠️ 2.2：**不再压到 48dp**。这张卡和上面「清空对话」一起回到
+                    // `Card` 的 M3E 标准高度（64dp），也就是上面那组 `ActionCard` 的高度 ——
+                    // 这正是「和上面的 m3e 设计贴近」那条要求。
+                    // 原来那对 `height(48.dp)` + 纵向 0 的 contentPadding 已删，
+                    // 理由见文件上方那段「2.2 回到 M3E 标准形态」的注释。
+                    //
+                    // ⚠️ 显式高度仍然要给，但目的是**让纵向居中生效**（有界高度），
+                    // 不是为了「压矮」——见 [SETTINGS_CARD_HEIGHT]。
                     //
                     // ⚠️ `AboutScreen` 里那四块 `AboutSection` 卡**不要动**：
                     // 它们是多行正文，64dp 对它们是合理的；用户说的是**设置页这张入口卡**。
-                    modifier = Modifier.height(SINGLE_LINE_CARD_HEIGHT),
-                    contentPadding = SINGLE_LINE_CARD_PADDING,
+                    modifier = Modifier.height(SETTINGS_CARD_HEIGHT),
                 )
             }
 

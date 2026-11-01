@@ -52,12 +52,12 @@ FISH_NAME = "大肥鱼"
 
 # 六块各自的**独有片段**：拿它证明「这一块真的有内容且是那一块」，
 # 不是随便一段文字。片段选的是每块里最能定性的一句。
-SOUL_MARK = "吃白饭大肥鱼"
-STYLE_MARK = "哦鲸鲸"
-RULES_MARK = "不通过情感绑架维系关系"
-SCENARIO_MARK = "研究所、休息室和用户的聊天窗口"
-EXAMPLES_MARK = "什么叫吃白饭啊"
-GREETING_MARK = "我刚才可没有摸鱼"
+SOUL_MARK = "你嘴上不认，其实早就听习惯了"
+STYLE_MARK = "就像在手机上跟熟人随手打字"
+RULES_MARK = "手表屏幕小，一次别刷屏"
+SCENARIO_MARK = "你住在一块手表里"
+EXAMPLES_MARK = "两碗token起步"
+GREETING_MARK = "说吧，我听着"
 
 # 开场白要**一屏读得完**：480×480 / 340dpi 实测，一条消息气泡大约能放 90~110 个汉字
 # （超过就要滑）。所以给一个硬上限，超了就报 FAIL ——
@@ -65,8 +65,8 @@ GREETING_MARK = "我刚才可没有摸鱼"
 # 用户进去第一眼看到的是它的后半截。
 GREETING_MAX_CHARS = 110
 
-# APK 里搜这一段：跨了 SOUL 的第二段，够长、够独特，R8 不会误伤。
-APK_MARK = "你既是带有 AI 特征的二次元女仆"
+# APK 里搜这一段：SOUL 第二段里的核心句，够长、够独特，R8 不会误伤。
+APK_MARK = "token 就是你的饭，三句话不离吃，饿了会直说"
 
 DEX_NAME = re.compile(r"classes\d*\.dex$")
 

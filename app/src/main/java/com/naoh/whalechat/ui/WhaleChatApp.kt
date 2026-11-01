@@ -14,6 +14,7 @@ import androidx.wear.compose.navigation.composable
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
 import androidx.wear.compose.navigation.rememberSwipeDismissableNavController
+import com.naoh.whalechat.data.BuiltinPersonas
 import com.naoh.whalechat.data.ChatEngine
 import com.naoh.whalechat.data.PersonaField
 import com.naoh.whalechat.data.PersonaSource
@@ -145,6 +146,26 @@ private object Routes {
     fun inputPresetField(index: Int, fieldKey: String) = "input/preset-field/$index/$fieldKey"
     const val INPUT_PRESET_FIELD_PATTERN = "input/preset-field/{index}/{fieldKey}"
 
+    // ------------------------------------------------------------------ 大肥鱼皮肤
+    /**
+     * 皮肤选择页（2.34）。
+     *
+     * [restart] 是**模式开关**，不是「要重启哪个角色」：这一页永远只服务大肥鱼
+     * （五个皮肤共用一个 id），所以值只用来区分首启模式 / 重开模式 ——
+     * 非空即重开。仍然把 personaId 带过来，是为了将来真有多角色皮肤时不用改路由。
+     *
+     * 用查询参数而不是路径段，理由和 [personaPreset] 一样：Navigation 对空值宽容，
+     * 参数缺失时走默认值，不会出现「少一截就匹配不上模板」的意外。
+     *
+     * ⚠️ 拼出去的值和 [FISH_SKIN_PATTERN] 必须逐字对应。
+     */
+    const val FISH_SKIN = "fish/skin"
+
+    fun fishSkin(restartPersonaId: String? = null): String =
+        "$FISH_SKIN?restart=${Uri.encode(restartPersonaId.orEmpty())}"
+
+    const val FISH_SKIN_PATTERN = "$FISH_SKIN?restart={restart}"
+
     /**
      * 文字输入页。对话页那个键盘按钮进这一页。
      *
@@ -190,13 +211,38 @@ fun WhaleChatApp() {
                         // 首页两页各自把「我是谁」传上去，设置页据此决定要不要多给一项
                         onOpenSettings = { navController.navigate(Routes.settings(it)) },
                         onOpenPersona = { personaId ->
-                            // 已有会话就复用，没有就现建一条并把 greeting 上架。
-                            // 返回 null 只有一种情况：这个角色已经不在了（被删之后
-                            // 页面还没刷新到）。那就什么都不做 —— 列表很快会自己消失掉那一行，
-                            // 硬导航到一个空会话只会多出一个空白页。
-                            ChatEngine.openPersonaChat(personaId)?.let {
-                                navController.navigate(Routes.chat(it))
+                            // ★ 2.34 首启拦截：第一次点大肥鱼 → 先挑皮肤，不直接进会话。
+                            //
+                            // 判据是 **id**（名字会随皮肤变，用名字判迟早失效）
+                            // + `fishSkinChosen()`（**不能**用「prefs 里有没有 fish_skin_key」，
+                            // 强覆盖会写 base，但用户一次都没选过 —— 见 ChatEngine 的注释）。
+                            //
+                            // 这一层（导航层）做判断，而不是把 navController 塞进 HomeScreen：
+                            // 「点一个联系人」只有在导航层才变成一条路由，数据层不该认识路由。
+                            // ★ 2.39：老用户（已有聊天记录、没选过皮肤）也一样先停一下 ——
+                            //    选择页最上面会多一张「保留原来的大肥鱼」，人可以什么都不改。
+                            if (personaId == BuiltinPersonas.BUILTIN_FISH_ID &&
+                                (!ChatEngine.fishSkinChosen() ||
+                                    ChatEngine.fishUpgradeChoicePending())
+                            ) {
+                                navController.navigate(Routes.fishSkin())
+                            } else {
+                                ChatEngine.openPersonaChat(personaId)?.let {
+                                    navController.navigate(Routes.chat(it))
+                                }
                             }
+                        },
+                        onRestartPersona = { personaId ->
+                            // ★ 2.34：「重新开始」不再弹二次确认框，改成先进选择页
+                            // （标题「换个性格，重新开始」）。选完皮肤才清空记录并进会话；
+                            // 返回就什么都不做 —— 聊天记录一个字都不动。
+                            //
+                            // 只有**大肥鱼**会走到这里：HomeScreen 里已经按 id 分流，
+                            // 其它角色照旧弹确认框、直接 restartPersona（它们没有皮肤可换）。
+                            //
+                            // 「先确认再清空」这道保险没有消失，只是换了位置：
+                            // 选择页上写明了「聊天记录会清空」，而点卡片是用户自己按的。
+                            navController.navigate(Routes.fishSkin(personaId))
                         },
                         onNewPersona = { navController.navigate(Routes.PERSONA_NEW) },
                         onOpenPersonaDetail = {
@@ -252,8 +298,22 @@ fun WhaleChatApp() {
                         // 最想看到的是 TA 开口；返回栈里不该留着预设页，否则从聊天页
                         // 返回会退回到一张「添加」页，而用户以为已经加过了。
                         onAddDirect = { persona ->
+                            // ★ 2.34：从预设页「添加」一条还没选过皮肤的大肥鱼时，
+                            // 同样先跳选择页。**必须先落库**（addBuiltinPersona 按 id 去重、
+                            // 顺手把会话和 greeting 建好），否则接下来的 applyFishSkin
+                            // 找不到这条 persona，会直接返回 null、屏幕上什么都没发生。
+                            //
+                            // 落库时用的是基础款；用户选完皮肤后，applyFishSkin 会把
+                            // 「还没聊过」的会话里的开场白换成新皮肤的（见那边的注释）。
+                            val needsSkinPick = persona.id == BuiltinPersonas.BUILTIN_FISH_ID &&
+                                (!ChatEngine.fishSkinChosen() ||
+                                    ChatEngine.fishUpgradeChoicePending())
                             val conversationId = ChatEngine.addBuiltinPersona(persona)
-                            if (conversationId.isNotEmpty()) {
+                            if (needsSkinPick) {
+                                navController.navigate(Routes.fishSkin())
+                            } else if (conversationId.isNotEmpty()) {
+                                // popUpTo(HOME) 和等待页那条**逐字一致**：用户点完「添加」，
+                                // 最想看到的是 TA 开口；返回栈里不该留着预设页。
                                 navController.navigate(Routes.chat(conversationId)) {
                                     popUpTo(Routes.HOME) { inclusive = false }
                                 }
@@ -345,6 +405,37 @@ fun WhaleChatApp() {
                             navController.navigate(
                                 Routes.importPhone(PhoneLanding.persona(personaId)),
                             )
+                        },
+                    )
+                }
+
+                // 大肥鱼皮肤选择页（2.34）。两个入口共用这一条路由：
+                //  * 首启：`restart` 为空串 → 标题「挑一条鱼」；
+                //  * 「重新开始」/ 预设页「添加」：`restart` 非空 → 标题「换个性格，重新开始」。
+                //
+                // 空串**必须**在进页面之前折成 null：`restartPersonaId != null` 就是
+                // 「要不要清空聊天记录」的判据，把空串当重开会把首启模式也变成删记录。
+                composable(
+                    route = Routes.FISH_SKIN_PATTERN,
+                    arguments = listOf(
+                        navArgument("restart") {
+                            type = NavType.StringType
+                            defaultValue = ""
+                        },
+                    ),
+                ) { entry ->
+                    FishSkinScreen(
+                        restartPersonaId = entry.arguments
+                            ?.getString("restart")
+                            .orEmpty()
+                            .ifBlank { null },
+                        // 选完直接进会话。**popUpTo(HOME)**：两个入口都希望
+                        // 「从聊天页返回 = 回到通讯录」，而不是退回选择页 —
+                        // 退回去会让人以为没选成功，还多一次误触机会。
+                        onPicked = { conversationId ->
+                            navController.navigate(Routes.chat(conversationId)) {
+                                popUpTo(Routes.HOME) { inclusive = false }
+                            }
                         },
                     )
                 }

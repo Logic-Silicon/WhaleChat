@@ -1,14 +1,24 @@
 package com.naoh.whalechat.ui
 
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.interaction.InteractionSource
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -21,16 +31,26 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.paneTitle
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -42,6 +62,8 @@ import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.ButtonDefaults
 import androidx.wear.compose.material3.Card
 import androidx.wear.compose.material3.CardDefaults
+import androidx.wear.compose.material3.CompactButton
+import androidx.wear.compose.material3.Dialog
 import androidx.wear.compose.material3.FilledTonalButton
 import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.MaterialTheme
@@ -50,6 +72,7 @@ import androidx.wear.compose.material3.Text
 import androidx.wear.compose.material3.TextToggleButtonDefaults
 import androidx.wear.compose.material3.TextToggleButtonShapes
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -150,6 +173,23 @@ fun ActionCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     contentPadding: PaddingValues = CardDefaults.ContentPadding,
+    /**
+     * 卡片内容色。默认 `onSurface`（= 2.1 及以前全部 20 个调用点的行为，逐字不变）。
+     *
+     * ⚠️ 2.2 新增的唯一用途：设置页「清空对话」要「灰容器 + error 色图标文字」
+     * （破坏性语义，和长按菜单里破坏性项同一套判断，见 `WhaleChatMenuDialog` 的 KDoc）。
+     * 传 `colorScheme.error` 时图标（走 `LocalContentColor`）和标题**一起**变色 ——
+     * 不要只给 `Text` 上色、把图标漏掉：那种「图标还是白的」最像没做完。
+     */
+    contentColor: Color = MaterialTheme.colorScheme.onSurface,
+    /**
+     * 标题最多几行。默认不限（原有调用点不受影响）。
+     *
+     * ⚠️ 2.2：设置页「清空对话 · 共 N 条」必须钉成 1 行 + Ellipsis —— 这个值在 1.978
+     * 是**实测**出来的：可用宽约 214dp，`titleMedium` 下「清空所有对话 · 共 999 条」已经
+     * 超过一行，不钉行数就会换行、整张卡长高，把圆屏下沿的东西顶出去。
+     */
+    titleMaxLines: Int = Int.MAX_VALUE,
 ) {
     Card(
         onClick = onClick,
@@ -157,7 +197,14 @@ fun ActionCard(
         contentPadding = contentPadding,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainer,
-            contentColor = MaterialTheme.colorScheme.onSurface,
+            contentColor = contentColor,
+            // ⚠️⚠️ **可点 `Card` 的 `LocalContentColor` 给的是 `titleColor`，不是
+            // `contentColor`**（Wear M3 1.5.6 `Card.kt:139`：
+            // `LocalContentColor provides colors.titleColor`；只有不可点的那个重载才用
+            // `colors.contentColor`，见 `Card.kt:379`）。
+            // 只传 `contentColor` 时界面**像素级不变、也不报错** —— 实测标题仍是
+            // `onSurface`(234,226,245)，而不是 error。所以两个都要给。
+            titleColor = contentColor,
         ),
     ) {
         // ⚠️⚠️ 1.982 补：外面套一个**撑满**的 `Box`，只做**垂直**居中。
@@ -192,7 +239,12 @@ fun ActionCard(
                     )
                 }
                 Column {
-                    Text(text = title, style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = titleMaxLines,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     if (!subtitle.isNullOrBlank()) {
                         Text(
                             text = subtitle,
@@ -658,62 +710,185 @@ private const val PI_F = Math.PI.toFloat()
 private const val TWO_PI = 2f * PI_F
 
 /**
+ * 屏幕上沿那行「说完就散」的短暂提示：复制成功（`已复制`）、模式切换（`Ask` / `Chat`）。
+ *
+ * ## ⚠️ 为什么要有这个组件（2.2 用户原话）
+ *
+ * 「复制文本后的『已复制』提示显示和**切换模式的提示文本显示效果统一**」。
+ *
+ * 2.1 之前这是**两份各写各的实现**：
+ *  * `ChatScreen` 里 `if (copied) Text(...)` —— `labelSmall` + `onSurfaceVariant` × 0.85 +
+ *    `top = 30.dp`、**没有动画**、停 1.4s；
+ *  * `HomeScreen` 里那个私有闪字组件（2.2 已删除）—— `labelMedium` + `onSurfaceVariant` 不透明 +
+ *    `top = 17.5.dp`、`fadeIn/fadeOut` + `defaultEffectsSpec`、停 2s。
+ *
+ * 两处各调一遍「看着差不多」不算统一：字号/颜色/位置/动画/时长任何一处漂移都会重新分叉。
+ * 所以**收成一份**，两处都只准调这个组件。
+ *
+ * ## 规格（为什么是这几个值）
+ *
+ * | 维度 | 值 | 依据 |
+ * |---|---|---|
+ * | 字号 | `labelMedium` | 取两处里较大的那个；`labelSmall`(13sp) 在 240dp 圆屏上偏小，`labelLarge`(15sp→墨迹 30px) 会顶到时间胶囊（技能册 06 分册 §76④ 量过） |
+ * | 颜色 | `onSurfaceVariant` **不加 alpha** | 与模式提示原有取值一致；带 alpha 会让两处深浅不同（用户要的就是一致）。⚠️ 技能册 §76④b 记过 `onSurfaceVariant` 在莫奈取色下偏亮带紫，另一种中性灰写法是 `onSurface × 0.55` —— 本轮按提示词规格选了前者，观感若再被否是**一个常量**的事 |
+ * | 位置 | [TransientLabelTop]（相对屏幕顶部） | 原模式提示的 17.5dp，装机调过的值；复制提示从 30dp 并过来 |
+ * | 动画 | `fadeIn/fadeOut` + `motionScheme.defaultEffectsSpec` | 淡入淡出属于「透明度/颜色」类，正是这条 spec 管的；不许手写 `tween` |
+ * | 停留时长 | [TransientLabelHoldMs]（**调用方**计时） | 两处共用一个常量，别各写一个 |
+ *
+ * ## 无状态（计时留在调用方）
+ *
+ * 组件只负责「长什么样 + 怎么淡入淡出」，`visible` 与停留时长由调用方管：
+ *  * `HomeScreen` 的计时挂在 `pagerState.isScrollInProgress` 上（滑动中显示、停手后留 N 秒）；
+ *  * `ChatScreen` 的计时挂在 `copied` 上（复制成功 → 显示 → N 秒后置 false）。
+ * 计时放进组件会让两处的触发语义糊在一起（一个是手势、一个是动作），也不便于复用。
+ *
+ * ⚠️ 用 `AnimatedVisibility` 而不是 `if (visible)`：`if` 会让「出现/消失」是硬切，
+ * 而 M3 的转场要求走 motionScheme —— 这也是两处原先唯一的差别，统一后必须两边都动。
+ */
+@Composable
+fun TransientLabel(
+    text: String,
+    visible: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val spec = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
+    AnimatedVisibility(
+        visible = visible,
+        modifier = modifier,
+        enter = fadeIn(animationSpec = spec),
+        exit = fadeOut(animationSpec = spec),
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * [TransientLabel] 距屏幕上沿的距离（dp）。
+ *
+ * 17.5dp 是 `HomeScreen` 模式提示原来那个落点：@340dpi ≈ 37px，
+ * 时间胶囊墨迹底约 36px，所以文字上沿刚好在胶囊下方、下沿约 37+26=63px。
+ * ⚠️ 装机实测过「不压时间胶囊」；但**对话页没有时间胶囊**（`ChatScreen` 的
+ * `ScreenScaffold` 没传 `timeText`），那边这行字会浮在正文上方 —— 这是覆盖层，
+ * 不遮滚动、不位移，见报告里的截图。
+ */
+val TransientLabelTop: Dp = 17.5.dp
+
+/**
+ * [TransientLabel] 的停留时长（毫秒）—— **两处共用这一个数**。
+ *
+ * 取模式提示原来的 2 秒（复制提示原来是 1.4 秒）：这是「说完就散」的长短，
+ * 2 秒足够读完「已复制」三个字又不会赖在屏幕上。改就只改这里。
+ */
+const val TransientLabelHoldMs: Long = 2_000L
+
+/**
+ * 长按唤出菜单时的触感反馈。
+ *
+ * 为什么要有它（2.2 §1.5 第 3 条）：Wear 上长按**没有触感反馈**时，用户按 400ms 不知道
+ * 到底触发没触发，手指一抬菜单没出来就会以为「这功能没做」。Compose 的 `combinedClickable`
+ * 只负责手势判定，**不会**替你震一下。
+ *
+ * ⚠️ 用平台的 `HapticFeedbackType.LongPress`（力度/时长由系统定），别自己造震动 ——
+ * 手表马达很轻，自选参数只会更难感觉。
+ * ⚠️ 返回的是**一个 lambda**而不是 `Modifier`：长按入口是 `Card(onLongClick = …)`，
+ * 没有 modifier 可挂。调用点必须在 Composable 作用域里（要读 `LocalHapticFeedback`）。
+ */
+@Composable
+fun rememberLongPressHaptic(action: () -> Unit): () -> Unit {
+    val haptic = LocalHapticFeedback.current
+    return remember(haptic, action) {
+        {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            action()
+        }
+    }
+}
+
+/**
+ * 菜单按钮按住时的轻微缩放（M3 Expressive 的「按压反馈」表达之一）。
+ *
+ * M3E 对按压的表达有两条路：形状变形（胶囊 → 圆角矩形）和**容器缩放**。
+ * Wear M3 1.5.6 的 `Button`/`FilledTonalButton` 都没有原生形状动画
+ * （`IconButton`/`ToggleButton` 族才有 `animatedShapes()`，见技能册 §71），
+ * 所以这里用 graphicsLayer 缩放补上；曲线走
+ * `MaterialTheme.motionScheme`（expressive，主题层已全局启用），不手写 tween。
+ *
+ * 缩放比 0.97：肉眼可感的「按进去了」，又不会让整宽按钮在圆屏边缘撞上别的元素。
+ * 返回时弹回用 defaultSpatialSpec（慢弹簧）。
+ */
+@Composable
+private fun Modifier.menuButtonPressScale(
+    interactionSource: InteractionSource,
+): Modifier {
+    val pressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.97f else 1f,
+        animationSpec = if (pressed) {
+            MaterialTheme.motionScheme.fastSpatialSpec<Float>()
+        } else {
+            MaterialTheme.motionScheme.defaultSpatialSpec<Float>()
+        },
+        label = "menuButtonPressScale",
+    )
+    return graphicsLayer {
+        scaleX = scale
+        scaleY = scale
+    }
+}
+
+/**
  * 菜单弹窗里的一项。
  *
  * [destructive] 用 error 色，跟普通项拉开距离 —— 「删角色」和上面那几项并排放在一起，
  * 光靠文字分不出轻重，颜色是最省事也最有效的那层区分。
+ *
+ * [icon] 可选。每项前面带一个图标（`AppIcons` 里已有的），没有合适图标的项传 null，
+ * 宁可不加不硬凑。
  */
 data class DialogAction(
     val label: String,
     val destructive: Boolean = false,
+    /** 可选图标。列表见 [AppIcons]；没有贴切的就传 null（默认），别硬凑。 */
+    val icon: ImageVector? = null,
     val onClick: () -> Unit,
 )
 
 /**
- * 一个标题 + 若干项动作的菜单弹窗。
+ * 一个标题 + 若干项动作的菜单弹窗 —— **按官方样例原样实现**（用户 2026-11-01 拍板）。
  *
- * 用 `AlertDialog` 的 **`content: ScalingLazyListScope` 重载**（而不是
- * confirmButton/dismissButton 那套两按钮版本）：长按一个角色要选的是三件事，
- * 塞进「确认 / 取消」两个槽里就得自己写一堆 Column，而 content 重载本来
- * 就是为「对话框里放一列东西」准备的。
+ * ## 官方依据（不是凭感觉，都是与工程同版本的源码）
  *
- * ## 为什么这里跟 [WhaleChatDialog] 长得不一样（按钮不撑满、三项挤在同一个 item 里）
+ * 1. **Wear M3 1.5.6 没有菜单组件**：`classes.jar` 里与弹层有关的顶层类只有
+ *    `AlertDialog` / `AlertDialogDefaults` / `ConfirmationDialog` / `OpenOnPhoneDialog` / `Dialog`。
+ * 2. 官方的「动作列表」写法见 `AlertDialogWithContentGroupsSample`（samples 源码）：
  *
- * 这块屏只有 240dp 见方（半径 240px），而 Wear M3 的 `Button` 布局高度**恒为 48dp**
- * —— 想压矮没用，`minimumInteractiveComponentSize` 会把布局重新撑回 48dp
- * （`ButtonDefaults.CompactButtonHeight` 也是 48dp，那 32dp 只是可见高度）。
- * 所以「三行按钮 + 一行标题」总共要 ~430px，而 480px 的屏幕里真正能放东西的
- * 只有圆心附近那一块：一个宽 w 的元素，整条都落在圆内的纵向区间是
- * `y ∈ [240 ± sqrt(240² - (w/2)²)]`，越宽越窄。
+ *    ```kotlin
+ *    AlertDialog(title = { Text("Share your location") }, edgeButton = { … }) {
+ *        item { FilledTonalButton(modifier = Modifier.fillMaxWidth(), label = { Text("Never share") }) }
+ *        item { FilledTonalButton(modifier = Modifier.fillMaxWidth(), label = { Text("Share always") }) }
+ *    }
+ *    ```
  *
- * 两个后果，都是量出来的：
+ *    即：**一项一个 `item`、整宽 `FilledTonalButton`、不自定宽度**。
+ * 3. `AlertDialog` 内部是 `ScalingLazyColumn(scalingParams = scalingParams(minTransitionArea = 0.2f))`，
+ *    内容超出视口时**滚动**，靠边的项按官方曲线缩小；底部留白 `noEdgeButtonBottomPaddingFraction
+ *    = 0.3646f`（屏高 36.46%，右滑关闭的手势区）。
+ *    ⇒ 「3 项一屏、不滚动、且完全等宽」在官方体系里**没有这种形态**（这也是 2.2 那版
+ *    自定义缩放/收窄的由来）。
  *
- * 1. **所有项塞进同一个 `item {}` 里，自己用 Column 排行距。** 每一项单独做 item
- *    时，对话框内部的 ScalingLazyColumn 会按自己的档位加行距（实测每项占 120px，
- *    比 48dp 的按钮高出 24px）；合成一项之后行距由下面这个 4dp 说了算，
- *    省下 ~48px。这是让「删角色」不被切掉的关键那一下。
- * 2. **按钮宽度收在 118dp（不是 `fillMaxWidth`）。** 撑满 428px 时安全纵向区间
- *    只剩 [84,396]，第三行「删角色」必然掉出去、胶囊底被圆边切平（截图确认过）；
- *    收到 236px 后区间扩到 [31,449]，三行就都完整了。118dp 也是标签量出来的：
- *    「重新开始」四个字配 Wear 的按钮内边距大约 92dp，比它宽一点，三个按钮
- *    宽度自然统一。
+ * ## 保留的增强（2.1.1 已过装机验收的三样，都写在代码里）
  *
- * 3. **名字不写进 `title` 槽，而是当内容区第一行的小字。** `title` 槽是必填的
- *    （Wear 四个重载都要它），但传空 lambda 高度就是 0（`Title()` 只负责套一层
- *    横向 padding，还会额外插一个 `AlertContentTopSpacing`）。实测把名字写在
- *    title 槽里那一行占 72px，挪进内容区当 labelMedium 只要 ~35px，省下的 40px
- *    正好是「删角色」能不能整条落进圆内所需要的那一段。
+ *  * 破坏性项：灰调容器 + **error 色图标与文字**（官方 ConfirmationDialog failure 色的语义：
+ *    ErrorDim 图标 + 弱化文字），**不整块红**；
+ *  * 每项独立 `interactionSource` + 按压缩放 0.97（M3E 按压反馈，曲线走 motionScheme）；
+ *  * 每项带 26dp 图标（`ButtonDefaults.IconSize`）。
  *
- * ## 为什么不放「取消」
- *
- * 不是漏了。加回来后就是**四项**（三件事 + 取消）。四项放不下 —— 「取消」整个落在
- * 屏幕外，长按之后根本看不见 —— 那才是真的把人堵住。去掉它剩三项，三项都能完整看见。
- *
- * 退出走两条 Wear 惯用路径，都通：
- * 1. 点对话框外面（`AlertDialog` 的 scrim 本来就接 `onDismissRequest`）；
- * 2. 按手表返回键（`AlertDialog` 内部把 Back 也接到 `onDismissRequest`）。
- *
- * 所以「取消」在这里是纯冗余，占的却是最稀缺的那一行的位置。
+ * 退出：右滑关闭 + 返回键（`AlertDialog` 窗口自带回调，另有页面层 `BackHandler` 兜底）；
+ * 点菜单项立刻关闭，不会挡住紧随其后的确认框。
  */
 @Composable
 fun WhaleChatMenuDialog(
@@ -721,73 +896,62 @@ fun WhaleChatMenuDialog(
     actions: List<DialogAction>,
     onDismiss: () -> Unit,
 ) {
+    BackHandler { onDismiss() }
     AlertDialog(
         visible = true,
         onDismissRequest = onDismiss,
-        // 名字放回 title 槽，但字号压到 labelMedium。
-        //
-        // 试过把它挪进内容区当第一行小字，结果反而更差（首个按钮从 128px 掉到
-        // 142px）：`alertDialogCommonContent` 在标题和内容之间**永远**会插一个
-        // `AlertContentTopSpacing`，所以「标题槽里的一行字」比「内容区里的一行字 +
-        // 那个固定间隔」更省。别绕这一圈。
-        title = {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth(),
-            )
-        },
-        // 上下留白钉死。默认那套是「整屏组件」的量法：上 10% 屏高（24dp）、
-        // 下 **36.46%**（87dp）—— 那个 36% 是留给「底部还有个 EdgeButton」的形态的，
-        // 我们这种「一列按钮、没有确认/取消」用不着。内容在这个对话框里是**顶对齐**
-        // 的（实测：把下留白从 87dp 改成 0 只挪动了 2px），所以真正有用的是上留白，
-        // 它必须 ≥24dp 才能避开屏幕顶端的系统时间胶囊 —— 保持默认值不动。
-        contentPadding = PaddingValues(start = 12.dp, top = 24.dp, end = 12.dp, bottom = 0.dp),
+        // 官方示例：title 用库默认样式（titleMedium / 居中 / 3 行 Ellipsis）。
+        title = { Text(text = title) },
+        // 官方留白：上 10% 屏高、左右 5.2%、下 36.46%（右滑关闭手势区）。
+        contentPadding = AlertDialogDefaults.contentPadding(),
     ) {
-        item {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                // **4dp。** 每个 Wear 按钮钉了 `.height(48.dp)` 之后，布局高**实测 96px**
-                // （density 2.0 ⇒ 48dp；不钉 height 的默认是 111px，见下面那段）。
-                // 三颗 = 288px，加两段 4dp（8px）行距 = 304px。对话框内容顶对齐、
-                // 上留白 24dp（48px），三行落在 y≈124–428px，整段都在圆内
-                // （宽 236px 时安全纵向区间 [31,449]）⇒ 「删角色」上下圆角都完整、底边不被切平
-                // （截图确认）。4dp 比原来的 0dp 肉眼能分出间隙，又不会把第三行顶出圆外。
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                actions.forEach { action ->
-                    Button(
-                        onClick = action.onClick,
-                        // Wear M3 的 `ButtonDefaults.shape` 是绝对半径 26dp，48dp 高的
-                        // 小按钮会被画成歪鸭蛋（和 [WhaleChatDialog] 里那段同一个坑）。
-                        shape = RoundedCornerShape(percent = 50),
-                        // **显式钉 48dp。** 不写这一行的话，按钮默认占 111px（55.5dp），
-                        // 三颗就多出 45px —— 而圆屏只肯给我们 414px 的纵向额度。
-                        // 顶部那排胶囊（[TopActionButtons]）也是这么钉的，同一套做法。
-                        modifier = Modifier
-                            .height(48.dp)
-                            .widthIn(min = 118.dp, max = 128.dp),
-                        colors = if (action.destructive) {
-                            ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.errorContainer,
-                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                            )
-                        } else {
-                            ButtonDefaults.buttonColors()
-                        },
-                    ) {
-                        Text(
-                            text = action.label,
-                            maxLines = 1,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth(),
+        actions.forEach { action ->
+            item {
+                val icon = action.icon
+                val label: @Composable RowScope.() -> Unit = {
+                    Text(
+                        text = action.label,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                val buttonIcon: (@Composable BoxScope.() -> Unit)? = if (icon != null) {
+                    {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = null,
+                            modifier = Modifier.size(ButtonDefaults.IconSize),
                         )
                     }
+                } else {
+                    null
+                }
+                // 每项一颗独立 interactionSource：按压缩放靠它听按压状态。
+                val pressSource = remember { MutableInteractionSource() }
+                val buttonModifier = Modifier
+                    .fillMaxWidth()
+                    .menuButtonPressScale(pressSource)
+                if (action.destructive) {
+                    Button(
+                        onClick = action.onClick,
+                        modifier = buttonModifier,
+                        interactionSource = pressSource,
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                            iconColor = MaterialTheme.colorScheme.error,
+                        ),
+                        icon = buttonIcon,
+                        label = label,
+                    )
+                } else {
+                    FilledTonalButton(
+                        onClick = action.onClick,
+                        modifier = buttonModifier,
+                        interactionSource = pressSource,
+                        icon = buttonIcon,
+                        label = label,
+                    )
                 }
             }
         }
@@ -870,6 +1034,18 @@ fun WhaleChatDialog(
     AlertDialog(
         visible = true,
         onDismissRequest = onDismiss,
+        // 标题离顶部的时间胶囊要留出空间,但官方默认上留白(10% 屏高)+ 标题前的
+        // 固定间隔,在「标题+两行正文+两颗按钮」这种短内容场景里把整块内容压得偏下
+        // (实测标题顶 y≈59,正文与取消之间 gap 42px,而取消与删除 EdgeButton 之间
+        // 只有 8px —— 节奏不均)。这里收窄上留白(48px→28px),让标题往上走,
+        // 正文→取消的间距由内容高度自然回归;底部间距由 ScreenScaffold 的
+        // edgeButtonSpacing(4dp)管理,不动。
+        // start/end 保持官方 5.2%(240dp 屏 = 12dp;本应用不做 RTL,直接写死)。
+        // ⚠️ bottom 在 EdgeButton 场景下被库忽略(ScreenScaffold 源码原文:
+        // 「The bottom padding value is always ignored because we instead use
+        // edgeButtonSpacing」),写 24dp 只是占位 —— 取消→删除的实际间距由
+        // 取消 item 的 padding(bottom = 12.dp) 提供(见下面 content 槽)。
+        contentPadding = PaddingValues(start = 12.dp, top = 28.dp, end = 12.dp, bottom = 24.dp),
         title = {
             Text(
                 text = title,
@@ -929,9 +1105,26 @@ fun WhaleChatDialog(
         },
     ) {
         item {
-            // 取消是**次要动作**：整宽的 tonal 按钮。见类注释里为什么不用 `TextButton`。
+            // 取消是**次要动作**：整宽的 tonal 按钮 —— 官方
+            // `AlertDialogWithContentGroupsSample` 的形态:EdgeButton(主操作贴底)
+            // 场景里,content 槽的按钮就是**整宽**的(样例里的 "Never share" /
+            // "Share always" 两颗都是 fillMaxWidth,和 EdgeButton 并存)。
+            //
+            // ## 第八轮返工(收窄取消)作废
+            //
+            // 曾把取消收窄到 240px 想「与 EdgeButton 弧形带对齐」,装机效果是
+            // 屏幕中部悬一颗小胶囊、下面贴一颗全宽弧形按钮 —— 两个形状语言
+            // 完全不同的元素上下排,比不收窄更难看(用户原话:「你告诉我这对齐了?」)。
+            // 官方样例里两者并存的正确关系就是「取消整宽 + 删除贴底全宽」:
+            // content 按钮受 5.2% 边距约束、EdgeButton 是全屏组件,宽度差是
+            // 官方形态自身的层次表达(次要 < 主要),不需要人为补齐。
+            //
+            // 与删除的间距:EdgeButton 贴底由 edgeButtonSpacing(4dp)管理,
+            // 给取消的 item 加 12dp 底距,总间隙 ~34px,与正文→取消的间距呼应。
             FilledTonalButton(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 12.dp),
                 onClick = onDismiss,
                 label = {
                     Text(

@@ -1,4 +1,4 @@
-﻿package com.naoh.whalechat.ui
+package com.naoh.whalechat.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -45,6 +45,7 @@ import androidx.wear.compose.material3.PagerScaffoldDefaults
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.Text
 import androidx.wear.compose.material3.TitleCard
+import com.naoh.whalechat.data.BuiltinPersonas
 import com.naoh.whalechat.data.ChatEngine
 import com.naoh.whalechat.data.Conversation
 import com.naoh.whalechat.data.Persona
@@ -152,7 +153,7 @@ private val TOP_ACTION_ICON_SIZE = 22.dp
  * 320dpi（半径 120dp）下同一点弦宽 ≈ 168dp ✓。
  *
  * ⚠️ 它与 [TOP_ACTION_WIDTH] 一样是**两页共用**的，别只改一页。
- * ⚠️ 它同时决定「模式提示」那条闪字能不能待在上面的空档里 —— 见 [MODE_FLASH_TOP]。
+ * ⚠️ 它同时决定「模式提示」那条闪字能不能待在上面的空档里 —— 见 TransientLabelTop（Components.kt）。
  */
 private val TOP_GAP = 10.dp
 
@@ -165,7 +166,7 @@ private val TOP_GAP = 10.dp
  *
  * ⚠️ 这个数是**上下都有代价**的：往上一格是按钮下沿、往下一格是内容。
  * 调大它会把首卡和底部「共 N tokens」那行一起往下推 —— 首屏内容不多时
- * 那行会被下边缘裁掉一部分。改之前先看 [MODE_FLASH_TOP] 和底部汇总那条注释。
+ * 那行会被下边缘裁掉一部分。改之前先看 TransientLabelTop（Components.kt）和底部汇总那条注释。
  */
 private val ACTIONS_GAP = 10.dp
 
@@ -330,7 +331,7 @@ private val HOME_SCALING: ScalingParams = ScalingLazyColumnDefaults.scalingParam
  *  * [CHAT] —— 通讯录。跟角色聊，人设是主角。
  *
  * 这两个名字**同时也是给用户看的**：滑过去时顶部会闪一行 `Ask` / `Chat`
- * （见 [displayName] 与 [ModeFlashLabel]）。**显示写法从枚举名推出来，不另抄一份** ——
+ * （见 [displayName] 与 TransientLabel 所在的 Components.kt）。**显示写法从枚举名推出来，不另抄一份** ——
  * 所以它们不只是内部代号，改的时候要当成 UI 文案改。
  *
  * 调用方也靠它区分来源：设置页要知道自己是从哪一页打开的
@@ -351,56 +352,41 @@ enum class HomePage {
 }
 
 /**
- * 顶部模式提示的停留时长。
- *
- * 「出现」跟着滑动动作走，「消失」不跟：手指一停就消失的话，
- * 想确认「我现在在哪一页」根本来不及看。所以手势结束后再多留 2 秒。
- */
-private const val MODE_FLASH_HOLD_MS = 2_000L
-
-/**
  * 模式提示文字的竖直落点。
  *
- * ## ⚠️ 它被按钮的位置来回搬过三次，最后一次是「搬回原处」
+ * ## ⚠️ 2.2：这个值搬进了 `Components.kt`（`TransientLabelTop = 17.5.dp`）
+ *
+ * 因为「已复制」和模式提示要**显示效果统一**，落点必须和字号/颜色/动画一起待在同一个组件里；
+ * 两处各留一个常量，迟早一边改一边不改。下面这段实测记录仍然有效，别删：
+ *
+ * ## 它被按钮的位置来回搬过三次，最后一次是「搬回原处」
  *
  * 1.976 是 **28dp** —— 那时按钮行在 126px 起，文字在按钮**上面**那条空档里。
  * 1.978 第一版把按钮抬到 64px 起，上面没地方了，于是挪到 75dp；
- * 第二版按钮落到 109px 起，又挪到 96dp —— 那两次都只能**塞在按钮和内容之间的缝里**，
- * 用户看到的就是「这行字从顶端跑下去了」。
+ * 第二版按钮落到 109px 起，又挪到 96dp —— 那两次都只能**塞在按钮和内容之间的缝里**。
  *
  * 第三轮（用户反馈后）：按钮宽 90dp → **70dp**，圆屏几何允许它重新上移，
  * 而 [TOP_GAP] 又保住了上沿 ≈49dp ⇒ 按钮上方那条空档**又回来了**，
- * 所以文字搬回 **28dp**，也就是它本来该在的地方。
+ * 所以文字搬回 **17.5dp**（= 37px），也就是它该在的地方。
  *
  * ## 落点怎么算的（340dpi 实测）
  *
  * ⚠️⚠️ **`labelLarge` 的墨迹是 30px 高，不是 20px**（实测：块顶 +9px 起算）。
- * 我按 20px 算过一轮，结果闪字的下沿和按钮上沿**差 1px 贴在一起**——
- * 数字得实测，不能按字号估。
- *
- * ⚠️⚠️ **这条带子的容量是定死的，改按钮位置必须回来重排这条线。**
- * 它的高度 = `按钮上沿 − 时间胶囊墨迹底`。按钮越往上，带子越窄，闪字就越被挤。
- *
- * 340dpi 实测（三次排布）：
+ * 340dpi 实测（两次排布）：
  * ```
  *                    时间胶囊底   闪字墨迹        按钮上沿   上留白  下留白
  *   第五轮 TOP_GAP=7.4dp    36px   41–67px(24)     73px      5px     6px   ← 太挤
  *   本轮 TOP_GAP=10dp       36px   45–69px(24)     79px     10px    10px   ← 定稿
  * ```
- * ⇒ **把闪字放在这条带子的正中**，两边留白相等；按钮往上挪就要同步把闪字往上挪，
- * 否则下留白先被吃光（第五轮就是下留白只剩 6px，用户反馈「影响提示小字」）。
- * ⚠️ 带子只剩 37px 的时候闪字**必须**用 `labelMedium`（墨迹 24px）；
- * 换回 `labelLarge`（30px）两边就只剩 3px，看着是粘在时间胶囊上的。
- * 本轮带子 44px，仍用 `labelMedium`（换成 labelLarge 也只剩 7px，没有实质收益）。
+ * ⇒ **把闪字放在这条带子的正中**，两边留白相等；按钮往上挪就要同步把闪字往上挪。
+ * ⚠️ 带子只剩 37px 的时候闪字**必须**用 `labelMedium`（墨迹 24px）——
+ * 已写进 `TransientLabel` 的规格里（`labelSmall` 太小、`labelLarge` 会粘住时间胶囊）。
  *
  * **它是覆盖层，不进列表布局。** 进了的话每次滑动都会把整页内容顶下去一截，
- * 而第二页那点竖直空间是算到像素的（见 [ContactsPage] 里那段几何推导）——
- * 再顶一下就会被圆边切掉。
+ * 而第二页那点竖直空间是算到像素的（见 [ContactsPage] 里那段几何推导）。
  *
  * ⚠️ 它同时受 [TOP_GAP] / [TOP_ACTION_WIDTH] 影响（两个都会挪按钮上沿）。
- * **动按钮位置就必须回来重看这一条。**
  */
-private val MODE_FLASH_TOP = 17.5.dp
 
 /**
  * 角色卡片右列（右上角日期 / 右下角钟点）与左侧内容（名字 / 用量）之间的**间隙**。
@@ -441,7 +427,7 @@ private val TimeColumnGap = 8.dp
  * `SwipeDismissableNavHost` 管 —— 从首页左边缘右滑照常退出应用；
  * 从第二页任意位置往右滑则回到第一页。这套判断是库内建的，不要自己写手势层去抢。
  *
- * 顶部还有一行**模式提示**（`Ask` / `Chat`，见 [ModeFlashLabel]）：
+ * 顶部还有一行**模式提示**（`Ask` / `Chat`，见 `Components.kt` 的 `TransientLabel`）：
  * 每次滑动都出现，停手 2 秒后淡出。它挂在页面**里面**，
  * 所以是跟着页面一起移动的，不会被 AnimatedPage 那套过渡落在后面。
  *
@@ -456,6 +442,15 @@ fun HomeScreen(
     /** 参数是**从哪一页点进设置的** —— 设置页拿它决定要不要多给一个「管理人设」入口。 */
     onOpenSettings: (HomePage) -> Unit,
     onOpenPersona: (String) -> Unit,
+    /**
+     * 长按 →「重新开始」。2.34 起**不再在这里弹二次确认**，而是把导航交给上层：
+     * 上层跳大肥鱼的选择页（标题「换个性格，重新开始」），选完皮肤才清记录。
+     *
+     * 为什么这样做：皮肤选择是「重新开始」的一部分 —— 用户按这个按钮想要的
+     * 往往就是「换个人（格）重新聊」，而弹一个「记录会清空」的确认框再让他
+     * 回通讯录长按一次，等于把两件事硬拆成两步。
+     */
+    onRestartPersona: (String) -> Unit,
     onNewPersona: () -> Unit,
     onOpenPersonaDetail: (String) -> Unit,
 ) {
@@ -485,7 +480,7 @@ fun HomeScreen(
         } else if (modeFlash) {
             // 手指抬起（含回落动画结束）之后再留 2 秒。中途又滑一下的话，
             // key 变化会让这个协程重启，计时自然重来。
-            delay(MODE_FLASH_HOLD_MS)
+            delay(TransientLabelHoldMs)
             modeFlash = false
         }
     }
@@ -513,64 +508,28 @@ fun HomeScreen(
 
                         else -> ContactsPage(
                             onOpenPersona = onOpenPersona,
+                            onRestartPersona = onRestartPersona,
                             onNewPersona = onNewPersona,
                             onOpenSettings = { onOpenSettings(HomePage.CHAT) },
                             onOpenPersonaDetail = onOpenPersonaDetail,
                         )
                     }
 
-                    ModeFlashLabel(
+                    // ⚠️ 2.2：这里原来调的是本文件私有的闪字组件（已删除），跟对话页的
+                    // 「已复制」各写一份实现（字号/颜色/位置/动画全都不同）。
+                    // 用户要求「显示效果统一」⇒ 两处共用一个 `TransientLabel`，
+                    // 私有实现**已删除**（留着就会有人下次又用它，两份实现重新分叉）。
+                    // 落点/字号/颜色/时长全在 `Components.kt` 里，这里只给对齐。
+                    TransientLabel(
                         text = HomePage.entries[page].displayName,
                         visible = modeFlash,
                         modifier = Modifier
                             .align(Alignment.TopCenter)
-                            .padding(top = MODE_FLASH_TOP),
+                            .padding(top = TransientLabelTop),
                     )
                 }
             }
         }
-    }
-}
-
-/**
- * 顶部那行模式提示：滑到哪一页就闪哪一页的名字（`Ask` / `Chat`），停手 2 秒后淡出。
- *
- * 淡出没有随手写时长，用的是 Wear M3 自己发布的动效规范：
- * `MaterialTheme.motionScheme.defaultEffectsSpec()` —— 它专管**透明度、颜色**
- * 这类不涉及位移的变化，正是淡入淡出该用的那一条。
- * 换成自己填的 `tween(200)` 也能动，但那等于把 M3 在低功耗设备上对
- * 时长与缓动的取舍丢掉，也失去了以后跟着主题一起变的能力。
- *
- * 排版是**最朴素的那一版**：`labelLarge` + `onSurfaceVariant`，不加字距、
- * 不做模糊、不拉伸字形。中间试过「小 + 疏 + 虚化」和「大 + 扁 + 压灰」两版，
- * 都被否掉了 —— **别再加回来的东西**：
- *  * `Modifier.blur` —— 这么小的字上只是把笔画糊在一起，而且 `RenderEffect`
- *    要 API 31+（minSdk 30 上是空操作）；
- *  * `letterSpacing` / `graphicsLayer { scaleX }` —— 用户要的不是这两种「宽」；
- *  * 颜色乘 alpha 压暗 —— 不在这一版里。
- */
-@Composable
-private fun ModeFlashLabel(
-    text: String,
-    visible: Boolean,
-    modifier: Modifier = Modifier,
-) {
-    val spec = MaterialTheme.motionScheme.defaultEffectsSpec<Float>()
-    AnimatedVisibility(
-        visible = visible,
-        modifier = modifier,
-        enter = fadeIn(animationSpec = spec),
-        exit = fadeOut(animationSpec = spec),
-    ) {
-        Text(
-            text = text,
-            // ⚠️ 这里原来是 `labelLarge`（墨迹实测 30px）。按钮按参考 app 上移到
-            // 73px 之后，时间胶囊墨迹底（36px）与按钮上沿之间只剩 37px ——
-            // 30px 的闪字塞进去两边各只剩 3px，看着是「粘」在时间胶囊上的。
-            // 降到 `labelMedium`（墨迹约 26px）才留得出呼吸。
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 }
 
@@ -708,7 +667,7 @@ private fun AskPage(
                             conversation = conversation,
                             renaming = renamingId == conversation.id,
                             onClick = { onOpenConversation(conversation.id) },
-                            onLongClick = { pendingRenameOrDelete = conversation },
+                            onLongClick = rememberLongPressHaptic { pendingRenameOrDelete = conversation },
                         )
                     }
                 }
@@ -781,14 +740,15 @@ private fun AskPage(
                 // 判据与会话自己的 `personaId` 对齐，不另造一个。
                 if (target.personaId == null) {
                     add(
-                        DialogAction("重新命名") {
+                        // 键盘：改名要去打字。
+                        DialogAction("重新命名", icon = AppIcons.Keyboard) {
                             pendingRenameOrDelete = null
                             ChatEngine.regenerateTitle(target.id)
                         },
                     )
                 }
                 add(
-                    DialogAction("删除", destructive = true) {
+                    DialogAction("删除", destructive = true, icon = AppIcons.Delete) {
                         pendingRenameOrDelete = null
                         pendingDelete = target
                     },
@@ -821,10 +781,20 @@ private fun AskPage(
  *
  * 「改名」和「人设详情」里那一行名字是同一个入口、同一条路由（改短字段），
  * 不是两套代码；既然详情页里点得到，菜单里就不重复放一份。
+ *
+ * ## 2.34：「重新开始」分成两条路
+ *
+ *  * **大肥鱼**（有五个皮肤）→ 直接进选择页，选完皮肤再清记录、进会话。
+ *    确认框没了，但「记录会清空」这句提示搬到了选择页上（点卡片是用户自己按的）。
+ *  * **其它角色**（用户自己造的，没有皮肤）→ 还是老样子：确认框 → `restartPersona`。
+ *    「换性格」对它们无从谈起，套一个皮肤选择页只会更费解。
+ *
+ * 判据用 **id**（[BuiltinPersonas.BUILTIN_FISH_ID]）而不是名字 —— 名字会随皮肤变。
  */
 @Composable
 private fun ContactsPage(
     onOpenPersona: (String) -> Unit,
+    onRestartPersona: (String) -> Unit,
     onNewPersona: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenPersonaDetail: (String) -> Unit,
@@ -839,7 +809,7 @@ private fun ContactsPage(
 
     /** 长按某一行之后停在哪个角色上（菜单 / 二次确认都从这里派生）。 */
     var menuFor by remember { mutableStateOf<Persona?>(null) }
-    /** 正在确认「重新开始」。 */
+    /** 正在确认「重新开始」（只有非大肥鱼的角色会用到，见 [ContactsPage] 的注释）。 */
     var restartTarget by remember { mutableStateOf<Persona?>(null) }
     /** 正在确认「删角色」。 */
     var deleteTarget by remember { mutableStateOf<Persona?>(null) }
@@ -930,7 +900,7 @@ private fun ContactsPage(
                             persona = persona,
                             showUsageOnPersona = settings.showUsageOnPersona,
                             onClick = { onOpenPersona(persona.id) },
-                            onLongClick = { menuFor = persona },
+                            onLongClick = rememberLongPressHaptic { menuFor = persona },
                         )
                     }
                 }
@@ -946,15 +916,23 @@ private fun ContactsPage(
             title = persona.name,
             onDismiss = { menuFor = null },
             actions = listOf(
-                DialogAction("人设详情") {
+                // 人形：人设详情是「看这个人」。
+                DialogAction("人设详情", icon = AppIcons.Person) {
                     menuFor = null
                     onOpenPersonaDetail(persona.id)
                 },
-                DialogAction("重新开始") {
+                // 星形（Sparkle）：「重新开始」和生成相关的动作同一族。
+                DialogAction("重新开始", icon = AppIcons.Sparkle) {
                     menuFor = null
-                    restartTarget = persona
+                    // 大肥鱼：进皮肤选择页（2.34），由那一页负责「换六块 → 清记录 → 进会话」。
+                    // 其它角色：没有皮肤可换，保持老的确认框 → restartPersona。
+                    if (persona.id == BuiltinPersonas.BUILTIN_FISH_ID) {
+                        onRestartPersona(persona.id)
+                    } else {
+                        restartTarget = persona
+                    }
                 },
-                DialogAction("删角色", destructive = true) {
+                DialogAction("删角色", destructive = true, icon = AppIcons.Delete) {
                     menuFor = null
                     deleteTarget = persona
                 },
@@ -962,7 +940,9 @@ private fun ContactsPage(
         )
     }
 
-    // 「重新开始」= 人设不动、清空消息、把存的 greeting 再上架一次。不联网、瞬间完成，
+    // 2.34：这个确认框现在**只服务非大肥鱼的角色**（用户自己造的，没有皮肤可换）。
+    // 大肥鱼走选择页，确认信息写在那张页面上。
+    // 「重新开始」对人设没有改动：清空消息、把存的 greeting 再上架一次。不联网、瞬间完成，
     // 所以文案要写明它做什么，不要写成「重置」这种含糊的词。
     restartTarget?.let { persona ->
         WhaleChatDialog(
@@ -980,7 +960,9 @@ private fun ContactsPage(
     deleteTarget?.let { persona ->
         WhaleChatDialog(
             title = "删掉 ${persona.name}？",
-            body = "和 TA 的聊天记录会一起删掉，无法恢复。",
+            // 2.37：长期记忆也会被级联删除 —— 这是隐私承诺（README 隐私一节），
+            // 确认框必须**说清楚**，不能让用户以为「只删聊天记录」。
+            body = "和 TA 的聊天记录、以及记下来的事会一起删掉，无法恢复。",
             confirmLabel = "删除",
             destructive = true,
             onConfirm = {

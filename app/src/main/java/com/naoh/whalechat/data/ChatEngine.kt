@@ -1,6 +1,7 @@
 package com.naoh.whalechat.data
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.naoh.whalechat.net.DeepSeekClient
 import com.naoh.whalechat.net.DeepSeekException
 import com.naoh.whalechat.net.SearchClient
@@ -19,6 +20,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.UUID
 
 /**
@@ -120,15 +125,210 @@ object ChatEngine {
      */
     private val deleted = mutableSetOf<String>()
 
+    /**
+     * 角色侧的 SharedPreferences（2.1 新增，与设置那套 prefs 分开）。
+     *
+     * 存三样东西：
+     *  * [KEY_FISH_DEFAULTS_APPLIED_23] / [KEY_FISH_SKINS_APPLIED_34] —— 两次「整份换人设」
+     *    的一次性强覆盖凭据，各只跑一次；
+     *  * [KEY_FISH_SKIN_KEY] / [KEY_FISH_SKIN_CHOSEN] —— 用户当前选中的皮肤、以及
+     *    「他到底主动选过没有」（2.34 首启选择页的判据，见 [fishSkinChosen]）。
+     *
+     * ⚠️ 这些键**只在 [seedBuiltinPersonasIfNeeded] 和 [applyFishSkin] 里读写**，
+     * 不进任何 personas 落盘路径；必须真正落盘（而不是内存），否则每次冷启动都会把
+     * 用户的人设改回去。
+     */
+    private lateinit var personaPrefs: SharedPreferences
+
+    /**
+     * 「此刻」状态的选择与保持（2.32 / P1），见 [PresenceStore]。
+     * 只有角色会话用得到；Ask 模式那条链路不碰它。
+     */
+    private lateinit var presence: PresenceStore
+
+    /**
+     * 长期记忆（2.37 / P3）：一张本地的「要点卡片」，落盘 `files/memories.json`。
+     *
+     * 全量常驻内存（上限 40 条 × 40 字，最多 1.6KB），读写都便宜，
+     * 所以**没有加状态流**：它只影响下一次发送时拼什么 prompt，界面不直接读它。
+     */
+    private lateinit var memoryStore: MemoryStore
+
+    /** 记忆内存副本。所有增删都在主线程做（与 `_personas` 同一套约定）。 */
+    private var memories: List<MemoryItem> = emptyList()
+
+    /**
+     * 记忆抽取的记账 prefs（`whalechat_memory`），与设置、角色两套 prefs **分开**。
+     *
+     * 只存一个键：`extracted_<conversationId>` = 上次抽取时**用户消息**的条数。
+     * 用它算「这 6 条是不是新的」；不落盘的话每次冷启动都会重复抽一遍，白花钱。
+     */
+    private lateinit var memoryPrefs: SharedPreferences
+
+    /** 大肥鱼 2.3 强覆盖是否已经跑过。落盘标记位，见 [KEY_FISH_DEFAULTS_APPLIED_23]。 */
+    private var fishDefaultsApplied23: Boolean
+        get() = ::personaPrefs.isInitialized &&
+            personaPrefs.getBoolean(KEY_FISH_DEFAULTS_APPLIED_23, false)
+        set(value) {
+            if (::personaPrefs.isInitialized) {
+                personaPrefs.edit()
+                    .putBoolean(KEY_FISH_DEFAULTS_APPLIED_23, value)
+                    .apply()
+            }
+        }
+
+    /**
+     * 「老用户还没决定：保留原人设，还是换个新性格」的标记（2.39）。
+     *
+     * 只有一种情况会置位：升级上来时**已经和这条鱼聊过**、且从未主动选过皮肤
+     * （见 `seedBuiltinPersonasIfNeeded` 里 `preserveLegacy` 那段）。
+     * 置位期间人设**保持原样**，第一次点鱼会进选择页，最上面多一张
+     * 「保留原来的大肥鱼」的卡。
+     *
+     * 用户在页面上做了任何选择（保留 / 换皮肤）都会把它清掉 —— 它只该出现一次。
+     */
+    private var fishUpgradeChoicePending: Boolean
+        get() = ::personaPrefs.isInitialized &&
+            personaPrefs.getBoolean(KEY_FISH_UPGRADE_CHOICE_PENDING, false)
+        set(value) {
+            if (::personaPrefs.isInitialized) {
+                personaPrefs.edit()
+                    .putBoolean(KEY_FISH_UPGRADE_CHOICE_PENDING, value)
+                    .apply()
+            }
+        }
+
+    /**
+     * 是不是「老用户还没决定」（2.39）。UI 用它决定：
+     *  * 点大肥鱼先不直接进会话，而是进选择页；
+     *  * 选择页标题改成「大肥鱼更新了」，并在最上面加一张「保留原来的大肥鱼」。
+     */
+    fun fishUpgradeChoicePending(): Boolean = fishUpgradeChoicePending
+
+    /**
+     * 老用户选择「保留原来的大肥鱼」：**人设一个字都不改**，只把「选过皮肤」记上，
+     * 然后进入会话。
+     *
+     * ⚠️ 不调 applyFishSkin、不调 restartPersona：前者会换六块，后者会清消息。
+     * 这里唯一的副作用是 prefs 里的两个布尔（`chosen=true`、`pending=false`）。
+     *
+     * @return 会话 id（没有就现建一条，开场白仍是原来那句）
+     */
+    fun keepLegacyFish(): String? {
+        val persona = findPersona(BuiltinPersonas.BUILTIN_FISH_ID) ?: return null
+        // key 归一到「当前皮肤」：老用户可能根本没有这个键，写一个能让读取路径稳定。
+        writeFishSkin(currentFishSkin(), chosen = true)
+        fishUpgradeChoicePending = false
+        return openPersonaChat(persona.id)
+    }
+
+    /**
+     * 「MC老登皮肤已下架」这次一次性迁移是否跑过（2.381）。见 [KEY_FISH_MC_REMOVED_381]。
+     *
+     * 和 [fishDaughterRemoved38] 同一个模式：already-落盘的六块文本不会因为删代码而消失，
+     * 所以必须主动覆盖一次；标记位保证只跑一次。
+     */
+    private var fishMcRemoved381: Boolean
+        get() = ::personaPrefs.isInitialized &&
+            personaPrefs.getBoolean(KEY_FISH_MC_REMOVED_381, false)
+        set(value) {
+            if (::personaPrefs.isInitialized) {
+                personaPrefs.edit()
+                    .putBoolean(KEY_FISH_MC_REMOVED_381, value)
+                    .apply()
+            }
+        }
+
+    /** 大肥鱼「2.34 换成五皮肤」那次强覆盖是否已经跑过。见 [KEY_FISH_SKINS_APPLIED_34]。 */
+    private var fishSkinsApplied34: Boolean
+        get() = ::personaPrefs.isInitialized &&
+            personaPrefs.getBoolean(KEY_FISH_SKINS_APPLIED_34, false)
+        set(value) {
+            if (::personaPrefs.isInitialized) {
+                personaPrefs.edit()
+                    .putBoolean(KEY_FISH_SKINS_APPLIED_34, value)
+                    .apply()
+            }
+        }
+
+    /**
+     * 「小女儿皮肤已下架」这次一次性迁移是否跑过（2.38）。见 [KEY_FISH_DAUGHTER_REMOVED_38]。
+     *
+     * 为什么需要一个标记位：这个迁移做的是「把已经落盘的六块文本覆盖回基础款」。
+     * 不记标记位的话，**每次冷启动都会再覆盖一次** —— 用户之后手动选/改过的设定
+     * 会被反复抹掉（和 2.3 强覆盖当初踩的是同一个坑）。
+     */
+    private var fishDaughterRemoved38: Boolean
+        get() = ::personaPrefs.isInitialized &&
+            personaPrefs.getBoolean(KEY_FISH_DAUGHTER_REMOVED_38, false)
+        set(value) {
+            if (::personaPrefs.isInitialized) {
+                personaPrefs.edit()
+                    .putBoolean(KEY_FISH_DAUGHTER_REMOVED_38, value)
+                    .apply()
+            }
+        }
+
+    /**
+     * 用户有没有**主动选过**皮肤。
+     *
+     * ⚠️ 这是首启选择页唯一的判据，**不能**用「prefs 里有 fish_skin_key」代替：
+     * 那个键在强覆盖时会被写成 `base`，可用户一次都没选过 —— 用键存在性判，
+     * 老用户升级上来会被直接放进基础款会话，永远看不到五皮肤。
+     *
+     * `personaPrefs` 还没初始化（`init` 之前）时返回 false：那种调用点本来也不该有，
+     * 兜底成「没选过」比崩掉好。
+     */
+    fun fishSkinChosen(): Boolean = ::personaPrefs.isInitialized &&
+        personaPrefs.getBoolean(KEY_FISH_SKIN_CHOSEN, false)
+
+    /**
+     * 用户当前皮肤。读不出来（没选过 / 键被清掉 / 值不认识）时用 [FishSkins.DEFAULT]。
+     *
+     * **这不代表「已经选过」**：种子和「重新加回」用它决定造哪一条鱼，
+     * 是否弹选择页仍然只看 [fishSkinChosen]。
+     */
+    fun currentFishSkin(): FishSkin = FishSkins.fromPrefs(
+        if (::personaPrefs.isInitialized) {
+            personaPrefs.getString(KEY_FISH_SKIN_KEY, null)
+        } else {
+            null
+        },
+    ) ?: FishSkins.DEFAULT
+
+    /** 写皮肤状态。[chosen] 单独给：强覆盖时要把「选过」打回 false。 */
+    private fun writeFishSkin(skin: FishSkin, chosen: Boolean) {
+        if (!::personaPrefs.isInitialized) return
+        personaPrefs.edit()
+            .putString(KEY_FISH_SKIN_KEY, skin.key.prefsValue)
+            .putBoolean(KEY_FISH_SKIN_CHOSEN, chosen)
+            .apply()
+    }
+
     fun init(context: Context) {
         if (::store.isInitialized) return
         store = ConversationStore(File(context.filesDir, "conversations.json"))
         personaStore = PersonaStore(File(context.filesDir, "personas.json"))
+        personaPrefs = context.getSharedPreferences("whalechat_persona", Context.MODE_PRIVATE)
+        presence = PresenceStore(context)
         settings = SettingsStore(context)
         usage = UsageStore(context)
         _conversations.value = store.load().sortedByDescending { it.sortKey }
         _personas.value = personaStore.load().sortedByDescending { it.sortKey }
         seedBuiltinPersonasIfNeeded()
+
+        // ★ 2.37：长期记忆。顺序在 personas 之后 —— 孤儿清理要知道「现在有哪些角色」。
+        memoryStore = MemoryStore(File(context.filesDir, "memories.json"))
+        memoryPrefs = context.getSharedPreferences("whalechat_memory", Context.MODE_PRIVATE)
+        memories = memoryStore.load()
+        val alivePersonaIds = _personas.value.map { it.id }.toSet()
+        val cleaned = MemoryExtract.cleanupOrphans(memories, alivePersonaIds)
+        if (cleaned.size != memories.size) {
+            // 孤儿 = 角色已经被删、但 memories.json 里还留着（进程被杀等边界）。
+            // 删完立刻写回；失败静默 —— 下次启动还会再清一次。
+            memories = cleaned
+            io.launch { runCatching { memoryStore.save(cleaned) } }
+        }
     }
 
     /**
@@ -153,16 +353,154 @@ object ChatEngine {
      * 排序键见 [Persona.sortKey]：没聊过的角色按 `createdAt` 排。给一个编译期时间戳
      * 会让它在「刚装完」的那一刻就沉到列表最底 —— 用户会以为没装上。
      *
+     * ## 2.34：种哪一条鱼由「上次选的皮肤」决定
+     *
+     * 补种时用 [currentFishSkin]（prefs 里的 `fish_skin_key`），读不到就用基础款。
+     * 但**「用了哪个皮肤」和「用户选过没有」是两件事**：种下来的这条鱼可能是基础款，
+     * 而 `fish_skin_chosen` 仍是 false —— 那种情况下用户点开它，先被带去选择页
+     * （判据在 [fishSkinChosen]）。
+     *
      * ## 落盘时机
      *
      * 直接调 [commitPersonas]（异步写），**不阻塞启动**。这一步失败也只是下次启动再补一遍，
      * 没有数据损失 —— 所以不需要 [savePersonaFromPhone] 那种同步写。
      */
     private fun seedBuiltinPersonasIfNeeded() {
-        val existing = _personas.value.any { it.id == BuiltinPersonas.BUILTIN_FISH_ID }
-        if (existing) return
-        _personas.value = _personas.value + BuiltinPersonas.fish()
-        commitPersonas()
+        val existing = findPersona(BuiltinPersonas.BUILTIN_FISH_ID)
+        if (existing == null) {
+            _personas.value = _personas.value + BuiltinPersonas.fish(skin = currentFishSkin())
+            // ⚠️ 种下去的同时要把两个「老用户强覆盖」的标记位记上。
+            //
+            // 不记的后果（2.34 实测踩到）：新装的用户第一次启动走这条路、直接 return，
+            // 标记位仍是 false；他选完皮肤（比如魔丸）之后**第二次冷启动**，
+            // 下面那两个 if 就会把他当成「2.33 升上来的老用户」，把皮肤冲回基础款、
+            // 把 `fish_skin_chosen` 打回 false —— 表现是「选的皮肤重启一次就变回去了，
+            // 而且又被弹回选择页」。所以「新种一条鱼」本身就是「已经是最新状态」的证据。
+            //
+            // 皮肤 prefs **不动**：这里可能是「用户选过、之后删了鱼再加回来」，
+            // 那种情况要沿用他上次选的皮肤（currentFishSkin()），不能打回默认。
+            fishDefaultsApplied23 = true
+            fishSkinsApplied34 = true
+            // 2.38：新种的鱼不可能是「小女儿」，也把下架迁移标记为已完成。
+            fishDaughterRemoved38 = true
+            // 2.381：同理，「MC老登」也不会被新种出来。
+            fishMcRemoved381 = true
+            commitPersonas()
+            return
+        }
+        // ★ 2.39：老用户可以选择「保留原人设」。
+        //
+        // 背景（用户 2026-11-01 反馈）：升级包对老用户做「整份换成新皮肤」，
+        // 用户会觉得「我原来是那条鱼，现在被动换掉了」，还容易误以为聊天记录也被覆盖。
+        // 所以：只要**已经和这条鱼聊过**（会话里至少有一条用户消息），
+        // 且**从未主动选过皮肤**，就**不覆盖人设**，改为第一次点她时给一张
+        // 「保留原来的大肥鱼」的卡（见 `FishSkinScreen`）。
+        //  * 选「保留」→ 什么都不改，只把 chosen 置 true（以后不再弹）；
+        //  * 选新皮肤 → 走 applyFishSkin，把六块换掉（那是用户自己的选择）。
+        // ⚠️ 两个覆盖的标记位照样记上：否则下次冷启动又会把它们当成「没跑过」。
+        // ⚠️ 聊天记录本来就一个字都不动；这一步只是让「人设」也不动。
+        val chattedWithFish = personaConversation(BuiltinPersonas.BUILTIN_FISH_ID)
+            ?.messages?.any { it.role == ChatRole.USER } == true
+        val preserveLegacy = chattedWithFish && !fishSkinChosen()
+        if (preserveLegacy) {
+            fishDefaultsApplied23 = true
+            fishSkinsApplied34 = true
+            fishUpgradeChoicePending = true
+            // 人设没动，不需要 commitPersonas()。
+        } else {
+            // ★ 2.3：一次性强行把人设换成新版（用户 2026-10-31 拍板「以 QQ 配置包那份为主」）。
+            //    2.1 的旧「定稿」整份作废 —— 2.3 把大肥鱼整份换成了「手表版」人设，
+            //    老用户装机后需要重新覆盖一次，所以标记位从 `_21` 升到 `_23`。
+            //    不做「只覆盖没改过的」判据 —— 用户改过的名字也会被覆盖回「大肥鱼」
+            //    （这会一次性抹掉用户给大肥鱼改过的名字；2.1 也是这么做的，已获用户同意）。
+            //    ⚠️ 只跑一次：标记位落盘（prefs）之后永不再覆盖，否则用户每改一次名字、
+            //    重启就被抹掉一次。标记位在 whalechat_persona prefs 里读写，不进任何落盘路径。
+            //    ⚠️ 覆盖时保留 existing.id / createdAt / lastChatAt（会话靠 personaId 找角色，
+            //    通讯录靠 lastChatAt 排序）；**聊天记录（conversations.json）一个字都不动**。
+            if (!fishDefaultsApplied23) {
+                _personas.value = _personas.value.map {
+                    if (it.id == BuiltinPersonas.BUILTIN_FISH_ID) {
+                        BuiltinPersonas.fish(id = existing.id)
+                            .copy(createdAt = existing.createdAt, lastChatAt = existing.lastChatAt)
+                    } else {
+                        it
+                    }
+                }
+                fishDefaultsApplied23 = true
+                commitPersonas()
+            }
+            // ★ 2.34：把 2.3 的「单份手表版」整份换成**基础款皮肤**，并把
+            //    `fish_skin_chosen` 打回 false —— 于是 2.33 升上来的老用户第一次点大肥鱼
+            //    会走一次选择流程（不这么做，他永远只会看到基础款）。
+            //
+            //    ⚠️ 顺序**必须**在 2.3 那一段之后：2.3 的覆盖写的是「手表版」，
+            //       2.34 的覆盖写的是「基础款皮肤」。反过来就又把基础款盖回手表版了。
+            //    ⚠️ 用 [BuiltinPersonas.withSkin] 而不是 `fish()`：保留 id / createdAt /
+            //       lastChatAt / source，通讯录排序和会话关联都不会跳。
+            //    ⚠️ 聊天记录不动。用户之前和「手表版大肥鱼」聊的内容原样留着 ——
+            //       人设换了不等于历史要删，「重新开始」才是清空历史的那条路。
+            if (!fishSkinsApplied34) {
+                _personas.value = _personas.value.map {
+                    if (it.id == BuiltinPersonas.BUILTIN_FISH_ID) {
+                        BuiltinPersonas.withSkin(it, FishSkins.DEFAULT)
+                    } else {
+                        it
+                    }
+                }
+                fishSkinsApplied34 = true
+                writeFishSkin(FishSkins.DEFAULT, chosen = false)
+                commitPersonas()
+            }
+        }
+        // ★ 2.38：「小女儿」皮肤下架（用户 2026-11-01 拍板）。
+        //
+        // 只删代码是不够的：已经在用电设备的 `personas.json` 里，六块文本是**当时复制进去的**，
+        // 删掉 [FishSkins] 里那份定义不会动到盘上的旧文本。所以这里做一次性的强覆盖：
+        //  * 判据两条 —— 存盘皮肤 key 是 `daughter`，**或者**角色名就是「小女儿」。
+        //    两道都要：用户可能在手机上把名字改过（第一条还在），
+        //    也可能之前切到了别的皮肤但名字没改回来（第二条兜底）。
+        //  * 覆盖成**基础款**（`FishSkins.DEFAULT`），保留 id / createdAt / lastChatAt；
+        //  * `chosen` 保持原值：已经选过皮肤的人不该被弹回选择页；
+        //  * 换完把 key 写成 `base`，避免 prefs 里永远留着一个已删除的枚举值。
+        //  * ⚠️ 只跑一次（标记位），否则用户之后改的设定会被每次冷启动抹掉。
+        if (!fishDaughterRemoved38) {
+            val storedKey = personaPrefs.getString(KEY_FISH_SKIN_KEY, null)
+            val isDaughter = storedKey == "daughter" ||
+                findPersona(BuiltinPersonas.BUILTIN_FISH_ID)?.name == "小女儿"
+            if (isDaughter) {
+                _personas.value = _personas.value.map {
+                    if (it.id == BuiltinPersonas.BUILTIN_FISH_ID) {
+                        BuiltinPersonas.withSkin(it, FishSkins.DEFAULT)
+                    } else {
+                        it
+                    }
+                }
+                writeFishSkin(FishSkins.DEFAULT, chosen = fishSkinChosen())
+                commitPersonas()
+            }
+            fishDaughterRemoved38 = true
+        }
+        // ★ 2.381：「MC老登」皮肤下架（用户 2026-11-01 拍板）。
+        //
+        // 和「小女儿」同一个处理：只删代码不够，盘上已经复制进去的六块文本要主动覆盖。
+        // 判据同样是两道（存盘 key / 角色名），覆盖成基础款，chosen 保持原值。
+        if (!fishMcRemoved381) {
+            val storedKey = personaPrefs.getString(KEY_FISH_SKIN_KEY, null)
+            val isMc = storedKey == "mc" ||
+                findPersona(BuiltinPersonas.BUILTIN_FISH_ID)?.name == "MC老登"
+            if (isMc) {
+                _personas.value = _personas.value.map {
+                    if (it.id == BuiltinPersonas.BUILTIN_FISH_ID) {
+                        BuiltinPersonas.withSkin(it, FishSkins.DEFAULT)
+                    } else {
+                        it
+                    }
+                }
+                writeFishSkin(FishSkins.DEFAULT, chosen = fishSkinChosen())
+                commitPersonas()
+            }
+            fishMcRemoved381 = true
+        }
     }
 
     /**
@@ -206,7 +544,12 @@ object ChatEngine {
         findPersona(BuiltinPersonas.BUILTIN_FISH_ID)?.let { existing ->
             return openPersonaChat(existing.id).orEmpty()
         }
-        return createPersonaChat(BuiltinPersonas.fish(id = BuiltinPersonas.freshFishId()))
+        return createPersonaChat(
+            BuiltinPersonas.fish(
+                skin = currentFishSkin(),
+                id = BuiltinPersonas.freshFishId(),
+            ),
+        )
     }
 
     fun find(id: String?): Conversation? =
@@ -275,6 +618,10 @@ object ChatEngine {
      *
      * 对正在流式输出的会话是安全的 —— 它至少已经有一条用户消息，
      * `messages.isEmpty()` 不成立，不会被误伤。
+     *
+     * ⚠️ 2.1 的「删除此信息」把会话删成零条消息后也依赖这条收尾 +
+     * `commit()` 里「空会话不写进文件」的过滤（[saveConversationsNow]）：
+     * 两个空壳来源用同一个口径，不在删除函数里另造一套。
      */
     fun discardEmpty() {
         _conversations.value = _conversations.value.filterNot { it.messages.isEmpty() }
@@ -485,6 +832,189 @@ object ChatEngine {
     }
 
     /**
+     * 换皮肤：**原地改那条大肥鱼的字段**，可选地顺手「重新开始」。
+     *
+     * 五个皮肤共用一个 id（[BuiltinPersonas.BUILTIN_FISH_ID]），所以换皮肤不是
+     * 新建角色、也不是删了重建 —— 会话、聊天记录、通讯录排序全都不用动。
+     * 保留的字段见 [BuiltinPersonas.withSkin]（改 id 会话就找不到人，
+     * 改 createdAt/lastChatAt 列表排序会跳）。
+     *
+     * ## ⚠️ 顺序不能反
+     *
+     * 先把六块写进 persona 并落盘，**再**调 [restartPersona] —— 那个函数读的是
+     * `findPersona(...).openingLine`，写之前调它，新会话上架的还是旧皮肤的开场白。
+     *
+     * ## [restart] = false 时也会刷新开场白的两种情况
+     *
+     *  * **从没聊过**（`lastChatAt == 0`）：会话里除了一句开场白什么都没有，
+     *    换掉它不是改历史。这和 [updatePersonaField] 改开场白时用的是同一条口径。
+     *  * 从预设页「添加」进来的新鱼：`addBuiltinPersona` 已经先建了一条带基础款
+     *    开场白的会话，用户这时才去选皮肤，不刷新就会「选的是贴吧老哥、
+     *    开口却是『在 / 说吧』」。
+     *
+     * 真的聊过之后，开场白就是历史的一部分，只有 [restart] = true（长按「重新开始」）
+     * 才会清空重来 —— 这条是产品口径，别为了「让新开场白看得见」去改它。
+     *
+     * ## 返回
+     *
+     * 会话 id（没有就现建一条）。返回 null 只有一种可能：大肥鱼已经不在通讯录里了
+     * （用户删过、而选择页还停在导航栈上）。调用方不该拿 null 去撞空白页。
+     *
+     * @param restart true = 清空消息、把新皮肤的开场白重新上架（「重新开始」那条路）
+     */
+    fun applyFishSkin(skin: FishSkin, restart: Boolean): String? {
+        val persona = findPersona(BuiltinPersonas.BUILTIN_FISH_ID) ?: return null
+        val updated = BuiltinPersonas.withSkin(persona, skin)
+
+        // 1) 六块 + 名字 + 副标题先落地。restartPersona 要读这条最新的 persona。
+        _personas.value = _personas.value.map {
+            if (it.id == persona.id) updated else it
+        }
+        commitPersonas()
+
+        // 2) 皮肤状态落盘。**chosen = true**：走到这里说明用户真的点了一张卡。
+        writeFishSkin(skin, chosen = true)
+        // 2.39：只要用户主动选了新皮肤，就说明「保留原人设」那个选择已经做完了。
+        fishUpgradeChoicePending = false
+
+        // 3) 会话侧：标题（角色会话标题恒等于角色名）和「还没聊过的开场白」跟着换。
+        //    流式输出中不能改消息，先停掉 —— 但只有 restart 那条路会真的换掉整个列表。
+        personaConversation(persona.id)?.let { conversation ->
+            val refreshGreeting = !restart && persona.lastChatAt == 0L
+            if (restart && _streamingId.value == conversation.id) stop()
+            if (conversation.title != skin.name || refreshGreeting) {
+                update(conversation.id) {
+                    it.copy(
+                        title = skin.name,
+                        titleGenerated = true,
+                        messages = if (refreshGreeting) {
+                            listOf(ChatMessage(ChatRole.ASSISTANT, updated.openingLine))
+                        } else {
+                            it.messages
+                        },
+                    )
+                }
+                commit()
+            }
+        }
+
+        // 4) 最后才「重新开始」：它负责清空消息 + 用 updated.openingLine 重新上架。
+        if (restart) restartPersona(persona.id)
+
+        // 5) 没有会话时现建一条（greeting 上架），把 id 交给调用方去导航。
+        return openPersonaChat(persona.id)
+    }
+
+    // ------------------------------------------------------- 主动消息（2.35）
+
+    /**
+     * 「打开即说」：打开一条**角色会话**时调一次，满足条件就先替 TA 说 1~3 句。
+     *
+     * 判定全在 [ProactivePolicy.shouldSpeak]（纯函数，六道闸），这里只负责：
+     * 取数据 → 调判定 → 拼句子 → 插消息 → 记账。**任何一条不满足就什么都不做。**
+     *
+     * ## 为什么在这里而不是在 ChatScreen 里判
+     *
+     * 页面只该说「打开了」，不该知道「隔了 4 小时 / 今天第几次 / 现在是不是凌晨」——
+     * 那些是产品规则，写进 UI 就没法单独测，也会和 Ask 页面纠缠。
+     * 而且插入消息要动 `_conversations`，本来就只有引擎能安全地做（主线程约定）。
+     *
+     * ## 硬性顺序（别调换）
+     *
+     * 1. `isBusy` → 正在流式绝不插话（否则会把正在生成的回复挤开，
+     *    而且 `update{}` 是「读一遍再整体写回」，和流式写回会互相覆盖）；
+     * 2. `personaId == null` → Ask 会话不参与（红线：不动 Ask）；
+     * 3. 判定通过才取状态、拼句子（读 prefs 失败不该影响判定）；
+     * 4. **先把消息写进会话并落盘，再写记账**：反过来（先记「说过了」再插消息）
+     *    一旦插消息失败，用户就永远等不到那句，而系统以为说过了 —— 这一轮就白白丢掉。
+     *
+     * ## 为什么每条是独立的 assistant 消息
+     *
+     * 2.35 时聊天页还是「一条消息一个气泡」（多气泡是 2.36）。拆成独立消息，
+     * **不用等 2.36 就能看到「她连发两句」**；2.36 之后也不会因此变成两层拆分。
+     * 时间戳都用同一个 `now`，排序稳定、观感是「一口气发出来」。
+     */
+    fun onChatOpened(conversationId: String) {
+        if (!::personaPrefs.isInitialized) return
+        if (isBusy) return
+
+        val conversation = find(conversationId) ?: return
+        val personaId = conversation.personaId ?: return
+        val persona = findPersona(personaId) ?: return
+
+        val settingsNow = settings.value
+        val zone = ZoneId.systemDefault()
+        val now = System.currentTimeMillis()
+
+        // 「上次说话」取会话里最后一条**用户**消息，不是角色自己的 lastChatAt：
+        // 主动消息刚插进来的那几条也是 assistant，用它们会让间隔永远差 0。
+        val lastUserAt = conversation.messages
+            .lastOrNull { it.role == ChatRole.USER }
+            ?.timestamp ?: 0L
+
+        val lastProactive = personaPrefs.getLong(proactiveLastKey(personaId), 0L)
+        val todayKey = proactiveCountKey(now, zone)
+        val todayCount = personaPrefs.getInt(todayKey, 0)
+
+        if (!ProactivePolicy.shouldSpeak(
+                now = now,
+                lastUserAt = lastUserAt,
+                lastProactive = lastProactive,
+                todayCount = todayCount,
+                enabled = settingsNow.proactiveEnabled,
+                zone = zone,
+            )
+        ) {
+            return
+        }
+
+        // 皮肤决定招呼语气；用户自建角色没有皮肤表 → null → 中性招呼（别套大肥鱼的口吻）。
+        val skinKey = if (persona.id == BuiltinPersonas.BUILTIN_FISH_ID) {
+            currentFishSkin().key
+        } else {
+            null
+        }
+        // 状态读取包一层 runCatching：这是「可选装饰」，读不到就只发招呼 + 关心（红线 7 失败静默）。
+        val state = runCatching { presence.stateFor(LocalDateTime.now(zone)) }.getOrDefault("")
+        val lines = ProactivePolicy.composeLines(
+            skinKey = skinKey,
+            gapMillis = now - lastUserAt,
+            hour = LocalDateTime.now(zone).hour,
+            state = state,
+            // ★ 2.37：有长期记忆就用它当钩子（记忆优先于状态，两者互斥）。
+            //   取这个角色**最近一条**记忆；没有就回落成上面那句状态。
+            memoryText = MemoryExtract.latestFor(memories, personaId)?.text,
+        )
+        if (lines.isEmpty()) return
+
+        val inserted = lines.map {
+            // ⚠️ 时间戳必须**具名**传：ChatMessage 第三个位置参数是 `reasoning`（String），
+            //    位置传 Long 会编译不过；就算将来签名变了，具名也不容易悄悄错位。
+            ChatMessage(role = ChatRole.ASSISTANT, content = it, timestamp = now)
+        }
+        update(conversation.id) {
+            it.copy(messages = it.messages + inserted, updatedAt = now)
+        }
+        commit()
+
+        personaPrefs.edit()
+            .putLong(proactiveLastKey(personaId), now)
+            .putInt(todayKey, todayCount + 1)
+            .apply()
+        // ⚠️ 刻意不调 generateTitleIfNeeded：角色会话的标题恒等于角色名，
+        //    叫模型总结一次会把名字冲掉（同 renamePersona 的注释）。
+    }
+
+    /** 每个角色各自的「上次主动开口」时间。键里带 personaId，换角色互不影响。 */
+    private fun proactiveLastKey(personaId: String) = "proactive_last_$personaId"
+
+    /** 当天的主动计数键：`proactive_count_yyyyMMdd`。按**本地时区**的日期，跨天自动换键。 */
+    private fun proactiveCountKey(now: Long, zone: ZoneId): String {
+        val date = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+        return "proactive_count_" + DateTimeFormatter.BASIC_ISO_DATE.format(date)
+    }
+
+    /**
      * 给角色改名。会话标题跟着一起改 —— 角色会话的标题就是角色名，两处必须同步。
      *
      * 只改 [Persona.name]，**不顺手去重写人设六块**：里面提到名字的地方（比如示例对话
@@ -616,6 +1146,13 @@ object ChatEngine {
             _conversations.value = _conversations.value.filterNot { it.id == conversation.id }
         }
         _personas.value = _personas.value.filterNot { it.id == personaId }
+        // ★ 2.37：删角色 = 连**长期记忆**一起删（P3.6 的隐私约定）。
+        //   和会话一样是级联删除；启动时的 orphan 清理只是兜底，不是主路径。
+        val keptMemories = memories.filterNot { it.personaId == personaId }
+        if (keptMemories.size != memories.size) {
+            memories = keptMemories
+            io.launch { runCatching { memoryStore.save(keptMemories) } }
+        }
         commitPersonas()
         commit()
     }
@@ -739,9 +1276,10 @@ object ChatEngine {
      * 以及更往后的所有追问）全部作废。理由：问句换了，后面那些回答回答的是**另一个**
      * 问题，留在上下文里只会让模型自相矛盾。
      *
-     * **只允许改最新那一问**，也就是「它后面再没有别的用户消息」。更早的提问一律拒绝：
-     * 作废的就不只是它自己那条回答了，而是它后面**已经发生过的整段对话** ——
-     * 用户要的边界就是这个（见下面的第二道闸）。
+     * ★ 2.1：**允许改任意一条提问**，不再限制「最新那一问」——用户 2026-10-24 明确要求
+     * 「所有用户发的都可以重编辑了」。代价是它后面已经生成过的内容全部作废，
+     * 这个后果由 UI 层先弹警告（显示真实条数 N）、用户确认后才走到这里；
+     * 数据层不再设第二道闸。
      *
      * 所有前置检查都在截断之前完成。顺序反了就会出现「对话少了一半、新消息却没发出去」
      * 这种最坏的中间态 —— send 内部还会再查一遍，这里提前拦是为了不让截断白做。
@@ -760,14 +1298,6 @@ object ChatEngine {
         val conversation = find(conversationId) ?: return
         val target = conversation.messages.getOrNull(index) ?: return
         if (target.role != ChatRole.USER) return
-
-        // 第二道闸：UI 已经不给更早那些长按了（ChatScreen 里按「最新一问」判据过滤），
-        // 这里再拦一次。真冒出一个「改中间那句」的调用，宁可什么都不做并说明原因，
-        // 也不能悄悄把后面几轮问答删掉 —— 那是用户明确不要的行为。
-        if (conversation.messages.drop(index + 1).any { it.role == ChatRole.USER }) {
-            _notice.value = "只能改最新那条提问"
-            return
-        }
 
         val kept = conversation.messages.take(index)
         // 被改掉的正好是这个会话的第一句：标题本来就是照着它起的，留着就成了一个
@@ -805,6 +1335,81 @@ object ChatEngine {
         startStream(conversationId)
     }
 
+    /**
+     * 删掉「最后一条用户消息 + 它对应的回复」。界面上叫「删除此信息」。
+     * 只对最后一条用户消息有意义；不是最后一条就什么也不做并说明原因。
+     *
+     * ★ 2.1 新增（用户原话：「只有最后一条用户所发信息支持，一带把所对应生成返回的
+     * 信息删除，不留上下文历史」）。删除范围 = 那条用户消息**起直到末尾**的全部消息
+     * （失败重试可能留下多条助手消息，所以是「到末尾全删」而不是「只删一条」）。
+     *
+     * ⚠️ 必须落盘（commit）：这是删除，不落盘下次启动又回来。
+     * ⚠️ 标题处理照 [rewrite] 的老规矩：删完一条用户消息都不剩时
+     * 清空标题（标题是照着第一句起的，第一句没了标题就该重新生成）。
+     * ⚠️ 流式中不许调用（isBusy 拦截）。
+     * 空会话的收尾交给既有的 discardEmpty / 「空会话不落盘」过滤，不在判断据里另造一套。
+     */
+    fun deleteLastUserExchange(conversationId: String) {
+        if (isBusy) {
+            _notice.value = "上一条还在回答，先等它说完"
+            return
+        }
+        val conversation = find(conversationId) ?: return
+        val index = conversation.messages.indexOfLast { it.role == ChatRole.USER }
+        if (index < 0) return
+        // 按定义它必然是最后一条用户消息，但要防御：不成立就说明并返回。
+        if (conversation.messages.drop(index + 1).any { it.role == ChatRole.USER }) {
+            _notice.value = "只有最后一条发送的消息可以删除"
+            return
+        }
+        val kept = conversation.messages.take(index)
+        val noQuestionLeft = kept.none { it.role == ChatRole.USER }
+        update(conversationId) {
+            it.copy(
+                messages = kept,
+                title = if (noQuestionLeft) "" else it.title,
+                titleGenerated = if (noQuestionLeft) false else it.titleGenerated,
+            )
+        }
+        commit()
+    }
+
+    /**
+     * 重新生成第 [index] 条助手消息。
+     * index 必须是 ASSISTANT 且内容为非空（空/失败的那些走 [retry]）。
+     *
+     * ★ 2.1 新增（用户要求「任意一条助手消息都能重新生成」）。
+     * 截断 = `take(index)`（把这条及其后全删），再补一条空的助手占位，
+     * 然后流式灌入 —— 与 [retry] 同样的形状（末尾必须是那条空占位，顺序别搞反）。
+     * ⚠️ 标题不要重置：重新生成的是回答，不是第一句提问。
+     * 后面还有内容时要不要警告由 UI 决定（数据层不弹窗）。
+     */
+    fun regenerate(conversationId: String, index: Int) {
+        if (isBusy) {
+            _notice.value = "上一条还在回答，先等它说完"
+            return
+        }
+        if (!hasApiKey()) {
+            _notice.value = "请先在设置里填写 DeepSeek API Key"
+            return
+        }
+        val conversation = find(conversationId) ?: return
+        val target = conversation.messages.getOrNull(index) ?: return
+        if (target.role != ChatRole.ASSISTANT) {
+            _notice.value = "只能重新生成回答"
+            return
+        }
+        if (target.content.isBlank()) {
+            _notice.value = "这条还没有内容，用「重试」再试一次"
+            return
+        }
+        val kept = conversation.messages.take(index)
+        update(conversationId) {
+            it.copy(messages = kept + ChatMessage(ChatRole.ASSISTANT, ""))
+        }
+        startStream(conversationId)
+    }
+
     fun stop() {
         client.cancel()
         streamJob?.cancel()
@@ -825,8 +1430,32 @@ object ChatEngine {
         // 下一次发送必须直接用新的。存一份拼好的结果就会出现「改了没效果」，
         // 而那是最难查的一类不一致（理由也写在 buildCorePrompt 上）。
         val persona = snapshot.personaId?.let(::findPersona)
+        // ★ 2.32 / P1：中间插一行【此刻】（几点 / 多久没聊 / 它此刻在干嘛），
+        //   消灭「永远在线、永远在等你」的感觉。三段顺序固定：人设 → 此刻 → 输出规矩。
+        //   ⚠️ 间隔取「会话里最后一条**用户**消息」的时间；取不到才退回 persona.lastChatAt
+        //   （那个字段是「上次在 TA 的会话里说过话」，和「上一条用户消息」不是一回事）。
+        //   ⚠️ 失败静默：PresenceStore 自己兜住异常，这里再 runCatching 一层，
+        //   最坏情况 = 这一行不出现，绝不影响发送。
+        val presenceLine = persona?.let { p ->
+            runCatching {
+                val lastUserAt = snapshot.messages
+                    .lastOrNull { it.role == ChatRole.USER }?.timestamp
+                presence.lineFor(
+                    now = java.time.LocalDateTime.now(),
+                    lastChatAt = lastUserAt ?: p.lastChatAt.takeIf { it > 0L },
+                )
+            }.getOrDefault("")
+        }.orEmpty()
+        // ★ 2.37：长期记忆块，插在**人设之后、此刻之前**（P3.5 指定的位置）。
+        //   为什么在这个位置：先让模型知道「这个人是谁、你是什么性格」，再告诉它
+        //   「你记得他哪些事」，最后才是此刻与输出规矩 —— 记忆夹在两段「设定」中间
+        //   读起来才是背景知识，放到规矩后面会被当成指令。
+        //   没有条目时是空串，`filter { isNotBlank }` 会整块跳过（不留空标题）。
+        val memoryBlock = persona
+            ?.let { MemoryExtract.rememberBlock(memories, it.id) }
+            .orEmpty()
         val systemPrompt = persona?.let {
-            listOf(it.buildCorePrompt(), CHAT_OUTPUT_RULES)
+            listOf(it.buildCorePrompt(), memoryBlock, presenceLine, CHAT_OUTPUT_RULES)
                 .filter { part -> part.isNotBlank() }
                 .joinToString("\n\n")
         } ?: current.systemPrompt
@@ -977,8 +1606,89 @@ object ChatEngine {
             _streamingId.value = null
             commit()
             generateTitleIfNeeded(conversationId)
+            // ★ 2.37：收尾后看看要不要抽一次长期记忆。
+            //   放在 commit 之后：抽取读的是**已经落盘的消息**，避免读到半截状态；
+            //   而且它内部整个包在 runCatching 里、只影响后台，不会拖慢这次回复的收尾。
+            maybeExtractMemories(conversationId)
         }
     }
+
+    /**
+     * 长期记忆抽取（2.37 / P3.3）：**一个后台小任务，失败完全静默**。
+     *
+     * ## 什么时候抽
+     *
+     * 只对**角色会话**；并且「上次抽取之后新增的用户消息 ≥ 6 条」才抽一次。
+     * 记账用 `whalechat_memory` prefs 的 `extracted_<conversationId>`（存用户消息条数）：
+     *  * 存条数而不是时间戳：条数是单调递增的，重启后还能对得上；
+     *  * **先记账再发请求**：这次抽失败也不重试 —— 重试只会每 6 条多花一次钱，
+     *    而且失败静默本来就是红线（P3 红线 7）。少记几条不影响对话。
+     *
+     * ## 花多少钱
+     *
+     * 一次 `complete()`：最近 12 条消息（≤2000 字）+ 120 tokens 输出。
+     * 比一轮正常对话便宜得多；而且**每 6 条用户消息才一次**。
+     *
+     * ## 失败怎么办
+     *
+     * 什么都**不**做：不弹窗、不重试、不写错误消息、不动会话。
+     * 最坏情况 = 这次没记住，下 6 条再说。
+     */
+    private fun maybeExtractMemories(conversationId: String) {
+        if (!::memoryPrefs.isInitialized || !::memoryStore.isInitialized) return
+        val conversation = find(conversationId) ?: return
+        val personaId = conversation.personaId ?: return   // Ask 会话不抽（红线 1）
+        val apiKey = settings.value.apiKey
+        if (apiKey.isBlank()) return
+
+        val userCount = conversation.messages.count { it.role == ChatRole.USER }
+        val extractedCount = memoryPrefs.getInt(memoryExtractKey(conversationId), 0)
+        if (userCount - extractedCount < MemoryExtract.EXTRACT_EVERY_USER_MESSAGES) return
+
+        // 先记账：见上面「先记账再发请求」。
+        memoryPrefs.edit().putInt(memoryExtractKey(conversationId), userCount).apply()
+
+        // 只把最近 12 条给模型；「对方 / 你」的标签比 role 字段更好读，也避免模型把
+        // 说话人搞反（示例对白那种「你 / TA」视角问题在这个项目里踩过）。
+        val recent = conversation.messages
+            .takeLast(MemoryExtract.RECENT_MESSAGES)
+            .joinToString("\n") { message ->
+                val who = if (message.role == ChatRole.USER) "对方" else "你"
+                "$who：${message.content}"
+            }
+            .take(MemoryExtract.RECENT_MAX_CHARS)
+
+        scope.launch {
+            runCatching {
+                client.complete(
+                    apiKey = apiKey,
+                    systemPrompt = MemoryExtract.PROMPT,
+                    userContent = recent,
+                    maxTokens = MemoryExtract.EXTRACT_MAX_TOKENS,
+                    temperature = MemoryExtract.EXTRACT_TEMPERATURE,
+                    readTimeoutSeconds = MemoryExtract.EXTRACT_TIMEOUT_SECONDS,
+                )
+            }.onSuccess { raw ->
+                val texts = MemoryExtract.parse(raw)
+                if (texts.isNotEmpty()) {
+                    val updated = MemoryExtract.merge(
+                        existing = memories,
+                        personaId = personaId,
+                        newTexts = texts,
+                        now = System.currentTimeMillis(),
+                    )
+                    if (updated != memories) {
+                        memories = updated
+                        io.launch { runCatching { memoryStore.save(updated) } }
+                    }
+                }
+            }
+            // onFailure 故意什么都不做（失败静默）。
+        }
+    }
+
+    /** 记账键：每条会话各自记「抽到第几条用户消息」。 */
+    private fun memoryExtractKey(conversationId: String) = "extracted_$conversationId"
 
     /**
      * 联网搜索 → 一段可以拼进上下文的「搜索资料」文本。**1.983 新增。**
@@ -1354,6 +2064,69 @@ object ChatEngine {
 
     /** 手表列表宽度有限，标题超过这个字数就会被截断成省略号。 */
     private const val TITLE_MAX = 12
+
+    /**
+     * 大肥鱼「2.3 强覆盖只跑一次」的标记位键。
+     *
+     * 存在 `whalechat_persona` prefs 里（[personaPrefs]），只被
+     * [seedBuiltinPersonasIfNeeded] 读写。
+     *
+     * ⚠️ 键名里的 `_23` 是版本号，不是序号：它和 2.1 的 `_21` 是**两个不同的键**，
+     * 所以老用户盘上那个旧键还在、但已经不读了 —— 覆盖会**再跑一次**，
+     * 这正是升版本号的目的。下次再整份换人设时同样要升成 `_24`，别复用旧键。
+     *
+     * 2.34 起它**仍然保留**：2.2 直接升到 2.34 的用户要先把人设换成 2.3 的手表版，
+     * 再被 [KEY_FISH_SKINS_APPLIED_34] 换成五皮肤的基础款（顺序见种子函数）。
+     */
+    private const val KEY_FISH_DEFAULTS_APPLIED_23 = "fish_defaults_applied_23"
+
+    /**
+     * 大肥鱼「2.34 换成五皮肤」强覆盖只跑一次的标记位键。
+     *
+     * 和上面那个是**两个独立的键**，理由相同：升版本号就是为了让覆盖再跑一次。
+     * 覆盖动作 = 把那条鱼换成基础款皮肤 + 把 [KEY_FISH_SKIN_CHOSEN] 打回 false，
+     * 于是 2.33 的老用户第一次点大肥鱼会走一次选择流程。
+     */
+    private const val KEY_FISH_SKINS_APPLIED_34 = "fish_skins_applied_34"
+
+    /**
+     * 「小女儿已下架」这次一次性迁移的标记位（2.38）。
+     *
+     * 每次冷启动检查一次「这条鱼是不是小女儿」，是就覆盖成基础款，然后记下这件事。
+     * 用**独立的键**（不是复用 `_34`）：`_34` 只表示「换过五皮肤」，
+     * 而这次是「删掉其中一份」 —— 两件事的先后顺序也不一样，合并会互相干扰。
+     * 下次再有皮肤下架，照这个模式加 `_39` / `_xx`，不要复用本键。
+     */
+    private const val KEY_FISH_DAUGHTER_REMOVED_38 = "fish_daughter_removed_38"
+
+    /**
+     * 「MC老登已下架」这次一次性迁移的标记位（2.381）。
+     *
+     * 独立键、独立标记：两次下架是两次产品决定，合并会互相干扰；
+     * 下次再删皮肤照这个模式加新键，**不要复用**。
+     */
+    private const val KEY_FISH_MC_REMOVED_381 = "fish_mc_removed_381"
+
+    /**
+     * 「老用户还没决定：保留原人设 / 换新性格」的标记位（2.39）。
+     *
+     * 值只在「升级上来、已有聊天记录、从未选过皮肤」时置 true；
+     * 用户在第一次选择页上做了选择（保留或换皮肤）后立刻清掉。
+     * **不要**把它当成「用户选过皮肤」的替代 —— 那个仍然是 `fish_skin_chosen`。
+     */
+    private const val KEY_FISH_UPGRADE_CHOICE_PENDING = "fish_upgrade_choice_pending"
+
+    /** 当前皮肤，存 [FishSkinKey.prefsValue]（`base` / `mowan` / …）。默认基础款。 */
+    private const val KEY_FISH_SKIN_KEY = "fish_skin_key"
+
+    /**
+     * 用户有没有**主动选过**皮肤。
+     *
+     * ⚠️ 和 [KEY_FISH_SKIN_KEY] 是**两个问题**，别合并成一个「键存在就算选过」：
+     * 强覆盖会写 `fish_skin_key = base`，但用户一次都没点过选择页。
+     * 首启选择页的判据只能是这个布尔值（见 [fishSkinChosen]）。
+     */
+    private const val KEY_FISH_SKIN_CHOSEN = "fish_skin_chosen"
 
     /**
      * 带上文的条数上限（一问一答算两条）。
